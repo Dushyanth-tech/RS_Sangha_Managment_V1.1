@@ -413,3 +413,56 @@ class FundTransaction(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class FundPayment(Base):
+    """A payment the member says they made. It counts only after an admin confirms it."""
+    __tablename__ = "fund_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[int] = mapped_column(ForeignKey("fund_requests.id"), index=True)
+    sangha_id: Mapped[int] = mapped_column(ForeignKey("sanghas.id"), index=True)
+    member_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(10))            # "interest" | "principal"
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    reference: Mapped[str] = mapped_column(String(60))       # UPI / bank transaction ID
+    status: Mapped[str] = mapped_column(String(12), default="Pending")   # Pending | Confirmed | Rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_fund_payment_amount_positive"),
+        # One waiting payment per member per type: stops double submits at DB level
+        Index(
+            "uq_one_pending_fund_payment", "member_id", "kind", unique=True,
+            postgresql_where=text("status = 'Pending'"),
+        ),
+    )
+
+class Contribution(Base):
+    """One row per day a member pays towards the Sangha. Counts only once an admin confirms it."""
+    __tablename__ = "contributions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(36), index=True)     # rows paid together share one batch
+    member_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    sangha_id: Mapped[int] = mapped_column(ForeignKey("sanghas.id"), index=True)
+    for_date: Mapped[date] = mapped_column(Date)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    reference: Mapped[str] = mapped_column(String(60))                # UPI / bank transaction ID
+    status: Mapped[str] = mapped_column(String(12), default="Pending")   # Pending | Confirmed | Rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_contribution_amount_positive"),
+        # A day can be paid once. A rejected day can be paid again.
+        Index(
+            "uq_contribution_day", "member_id", "for_date", unique=True,
+            postgresql_where=text("status IN ('Pending','Confirmed')"),
+        ),
+    )

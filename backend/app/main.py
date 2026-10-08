@@ -3,23 +3,24 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 # from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from app.authSchema import NewUser, LoginUser, NewSanghas, Search, AdminRequestCreate,AddAdminRequest,RemoveSanghasPayload,SanghaUpdate, ProfileWizardUpdate, NotificationCreate, ClearNotificationsRequest, SanghaSavingsAccountCreate, CibilUpdate, FundRequestCreate, FundRequestReview, FundRepaymentCreate
+from app.authSchema import NewUser, LoginUser, NewSanghas, Search, AdminRequestCreate,AddAdminRequest,RemoveSanghasPayload,SanghaUpdate, ProfileWizardUpdate, NotificationCreate, ClearNotificationsRequest, SanghaSavingsAccountCreate, CibilUpdate, FundRequestCreate, FundRequestReview, FundRepaymentCreate, FundPaymentCreate, FundPaymentConfirm, FundPaymentReject, ContributionCreate
 from decimal import Decimal
 from app.authModal import (
     User, Sanghas, SubAdminRequest, RequestStatus, BankDetails, Notification,
     NotificationRecipient, SanghaSavingsAccount, Loan, LoanRepayment,
     LoanStatus, VerificationRequest,    FundRequest, FundRepayment, FundTransaction, FundRequestStatus,
-    NotificationType, RecipientRule, NotificationStatus,
+    NotificationType, RecipientRule, NotificationStatus, FundPayment, Contribution
 )
 from app.dbconnection import get_db, engine, Base
 from app.auth import create_access_token, hash_password, verify_password, get_current_user
 from sqlalchemy import or_,func, select
 from sqlalchemy.orm import aliased, Session, joinedload
 from sqlalchemy.exc import IntegrityError
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 import re
 import json
 import os, uuid
+import calendar
 
 app = FastAPI()
 
@@ -2214,10 +2215,13 @@ def get_member_home_summary(
     cibil_score = getattr(user, "cibil_score", None)
     outstanding_debt = getattr(user, "outstanding_debt", None) or 0
 
+    debts = _member_debts(db, user.id)
     return {
         "savings": savings,
         "cibilScore": user.cibil_score,
-        "outstandingDebt": float(_member_outstanding(db, user.id)),
+        "outstandingDebt": float(sum((d["outstanding"] for d in debts), ZERO)),
+        "interestDue": float(sum((d["interest"] for d in debts), ZERO)),
+        "interestRate": float(INTEREST_RATE_PERCENT),
     }
 
 @app.patch("/superadmin/members/{member_id}/cibil")
@@ -2528,6 +2532,13 @@ def get_savings_overview(
         reps = db.query(FundRepayment).filter(FundRepayment.member_id == user.id).all()
         month_start = _month_start()
 
+        debts = _member_debts(db, user.id)
+        pending_payments = (
+            db.query(FundPayment)
+            .filter(FundPayment.member_id == user.id, FundPayment.status == "Pending")
+            .all()
+        )
+
         result["member"] = {
             "verificationStatus": _verification_label(db, user),
             # ASSUMPTION: money credited to the member from requests still being repaid.
@@ -2541,12 +2552,32 @@ def get_savings_overview(
             )),
             "profile": {"fullname": user.fullname, "phone": user.phone, "address": user.address},
             "trust": _trust(db, user.id),
+            # ---- interest + payments ----
+            "interestRate": float(INTEREST_RATE_PERCENT),
+            "interestDue": float(sum((d["interest"] for d in debts), ZERO)),
+            "debts": [
+                {
+                    "id": d["req"].id,
+                    "approvedAmount": float(d["req"].amount_approved or 0),
+                    "outstanding": float(d["outstanding"]),
+                    "interest": float(d["interest"]),
+                    "monthlyInterest": float(
+                        (d["outstanding"] * INTEREST_RATE_PERCENT / 100).quantize(Decimal("0.01"))
+                    ),
+                    "disbursedAt": d["req"].disbursed_at.isoformat() if d["req"].disbursed_at else None,
+                }
+                for d in debts
+            ],
+            "pendingPayments": [
+                {"id": p.id, "kind": p.kind, "amount": float(p.amount),
+                 "reference": p.reference, "createdAt": p.created_at.isoformat()}
+                for p in pending_payments
+            ],
         }
         blockers = _blockers(db, user, sangha, account, balance)
         result["eligibility"] = {"canRequest": not blockers, "reasons": blockers}
 
     return result
-
 
 # ---------------------------------------------------------------------
 # GET /sangha-savings/history
@@ -2569,7 +2600,7 @@ def get_savings_history(
     is_member = user.role == "member"
     sangha = None if is_member else _scoped_sangha(db, user, sangha_id)
     if not is_member and not sangha:
-        return {"requests": [], "repayments": [], "transactions": []}
+        return {"requests": [], "repayments": [], "transactions": [], "payments": []}
 
     def scope(model):
         return model.member_id == user.id if is_member else model.sangha_id == sangha.id
@@ -2586,6 +2617,11 @@ def get_savings_history(
         db.query(FundTransaction).filter(scope(FundTransaction))
         .order_by(FundTransaction.created_at.desc(), FundTransaction.id.desc()).limit(100).all()
     )
+    pays = (
+        db.query(FundPayment)
+        .filter(scope(FundPayment), FundPayment.status.in_(("Pending", "Rejected")))
+        .order_by(FundPayment.created_at.desc()).limit(50).all()
+    )
 
     req_by_id = {}
     if reps:
@@ -2598,6 +2634,7 @@ def get_savings_history(
         | {r.reviewed_by for r in reqs if r.reviewed_by}
         | {p.member_id for p in reps}
         | {t.member_id for t in txns}
+        | {p.member_id for p in pays}
     )
     names = {}
     if user_ids:
@@ -2655,6 +2692,20 @@ def get_savings_history(
         "requests": requests_out,
         "repayments": repayments_out[:100],
         "transactions": transactions_out,
+        "payments": [
+            {
+                "id": p.id,
+                "requestId": p.request_id,
+                "memberName": names.get(p.member_id),
+                "kind": p.kind,
+                "amount": float(p.amount),
+                "reference": p.reference,
+                "status": p.status,
+                "createdAt": p.created_at.isoformat(),
+                "rejectionReason": p.rejection_reason,
+            }
+            for p in pays
+        ],
     }
 
 
@@ -2736,11 +2787,20 @@ def get_fund_request_detail(
     account = _account_for(db, req.sangha_id)
     trust = _trust(db, req.member_id)
 
-    reps = (
+    all_reps = (
         db.query(FundRepayment)
         .filter(FundRepayment.member_id == req.member_id)
-        .order_by(FundRepayment.paid_at.desc()).limit(10).all()
+        .order_by(FundRepayment.paid_at.desc())
+        .all()
     )
+
+    active = (
+        db.query(FundRequest)
+        .filter(FundRequest.member_id == req.member_id, FundRequest.status.in_(ACTIVE_STATUSES))
+        .order_by(FundRequest.disbursed_at.desc())
+        .all()
+    )
+    active_map = _repaid_map(db, [a.id for a in active])
     rm = _repaid_map(db, [req.id])
 
     return {
@@ -2762,13 +2822,26 @@ def get_fund_request_detail(
         "currentOutstanding": trust["currentOutstanding"],
         "repaymentConsistency": trust["repaymentConsistency"],
         "requestOutstanding": float(_outstanding_of(req, rm)),
+        # Interest / repayment history
+        "totalInterestPaid": float(sum((_d(p.interest) for p in all_reps), ZERO)),
+        "totalRepayments": len(all_reps),
+        "onTimeRepayments": sum(1 for p in all_reps if p.is_on_time),
         "repayments": [
             {"paidAt": p.paid_at.isoformat(), "principal": float(p.principal),
              "interest": float(p.interest), "isOnTime": p.is_on_time}
-            for p in reps
+            for p in all_reps[:10]
+        ],
+        # Debt the member already has
+        "activeDebts": [
+            {
+                "id": a.id,
+                "approvedAmount": float(a.amount_approved or 0),
+                "outstanding": float(_outstanding_of(a, active_map)),
+                "disbursedAt": a.disbursed_at.isoformat() if a.disbursed_at else None,
+            }
+            for a in active
         ],
     }
-
 
 # ---------------------------------------------------------------------
 # PATCH /sangha-savings/requests/{id}/review
@@ -2791,6 +2864,7 @@ def review_fund_request(
     elif payload.action == "approve":
         if req.status not in decidable:
             raise HTTPException(status_code=400, detail="This request has already been decided.")
+
         member = db.query(User).filter(User.id == req.member_id).first()
         if not member or not member.isVerified:
             raise HTTPException(status_code=400, detail="The member's account must be verified first.")
@@ -2799,18 +2873,32 @@ def review_fund_request(
         if amount > _d(req.amount_requested):
             raise HTTPException(status_code=422, detail="Approved amount cannot exceed the requested amount.")
 
-        account = _account_for(db, req.sangha_id)
-        if not account or account.status != "Active" or _balance(account) < amount:
+        # Lock the Sangha account so two approvals can't spend the same money
+        account = _account_for(db, req.sangha_id, lock=True)
+        if not account or account.status != "Active":
+            raise HTTPException(status_code=400, detail="No active Sangha Savings Account is available.")
+
+        balance = _balance(account)
+        if balance < amount:
             raise HTTPException(status_code=400, detail="Insufficient Sangha Savings balance for this amount.")
 
-        req.status = FundRequestStatus.approved
+        # Approve AND credit in one transaction
+        _store_balance(account, balance - amount)
         req.amount_approved = amount
-                # approve branch
+        req.status = FundRequestStatus.disbursed
+        req.disbursed_at = datetime.utcnow()
+
+        db.add(FundTransaction(
+            sangha_id=req.sangha_id, member_id=req.member_id, request_id=req.id,
+            kind="disbursement", amount=amount, created_by=user.id,
+        ))
+
         _notify_user(
             db, user.id, req.member_id, "Fund Request Approved",
-            f"Your request for ₹{req.amount_requested:,.2f} has been approved.\n\n"
+            f"Your request for ₹{req.amount_requested:,.2f} has been approved and "
+            f"₹{amount:,.2f} has been credited to you from Sangha Savings.\n\n"
             f"Approved Amount: ₹{amount:,.2f}\n"
-            f"Status: Approved",
+            f"Status: Approved & Credited",
             req.sangha_id,
         )
 
@@ -2950,10 +3038,16 @@ def get_request_inbox_count(
     db: Session = Depends(get_db),
     current_user_id=Depends(get_current_user),
 ):
-    """Bell badge: only requests still waiting for a first review (status = pending)."""
+    """Bell badge: pending fund requests + payments + contributions waiting for the admin."""
     user = _load_user(db, current_user_id)
-    count = _inbox_query(db, user).filter(FundRequest.status == FundRequestStatus.pending).count()
-    return {"count": count}
+
+    requests_waiting = _inbox_query(db, user).filter(FundRequest.status == FundRequestStatus.pending).count()
+    payments_waiting = _payments_query(db, user).filter(FundPayment.status == "Pending").count()
+    contribution_batches = {
+        c.batch_id
+        for c, _, _ in _contributions_query(db, user).filter(Contribution.status == "Pending").all()
+    }
+    return {"count": requests_waiting + payments_waiting + len(contribution_batches)}
 
 
 @app.get("/sangha-savings/inbox")
@@ -3006,6 +3100,547 @@ def get_request_inbox(
             for r, sangha, member in rows
         ],
     }
+
+# =====================================================================
+# INTEREST + MEMBER PAYMENTS
+# =====================================================================
+
+INTEREST_RATE_PERCENT = Decimal("10")   # per month, on the outstanding principal
+
+
+def _interest_due_for(db: Session, req: FundRequest, outstanding: Decimal) -> Decimal:
+    """2% of the outstanding principal, minus interest already paid this month on this request."""
+    monthly = (outstanding * INTEREST_RATE_PERCENT / 100).quantize(Decimal("0.01"))
+    paid = (
+        db.query(func.coalesce(func.sum(FundRepayment.interest), 0))
+        .filter(FundRepayment.request_id == req.id, FundRepayment.paid_at >= _month_start())
+        .scalar()
+    )
+    return max(monthly - _d(paid), ZERO)
+
+
+def _member_debts(db: Session, member_id: int) -> list[dict]:
+    """Every request the member still owes on, oldest first, with principal and interest due."""
+    reqs = (
+        db.query(FundRequest)
+        .filter(FundRequest.member_id == member_id, FundRequest.status.in_(ACTIVE_STATUSES))
+        .order_by(FundRequest.disbursed_at.asc(), FundRequest.id.asc())
+        .all()
+    )
+    rm = _repaid_map(db, [r.id for r in reqs])
+    debts = []
+    for r in reqs:
+        outstanding = _outstanding_of(r, rm)
+        if outstanding > 0:
+            debts.append({
+                "req": r,
+                "outstanding": outstanding,
+                "interest": _interest_due_for(db, r, outstanding),
+            })
+    return debts
+
+
+def _apply_repayment(db: Session, user: User, req: FundRequest, principal: Decimal,
+                     interest: Decimal, is_on_time: bool) -> dict:
+    """Records a repayment and returns the money to the Sangha fund. Caller commits."""
+    if req.status not in ACTIVE_STATUSES:
+        raise HTTPException(status_code=400, detail="Repayments can only be recorded for disbursed requests.")
+    if principal + interest <= 0:
+        raise HTTPException(status_code=422, detail="Enter a repayment amount greater than ₹0.")
+
+    outstanding = _outstanding_of(req, _repaid_map(db, [req.id]))
+    if principal > outstanding:
+        raise HTTPException(status_code=422, detail=f"Principal exceeds the outstanding amount (₹{outstanding:,.2f}).")
+
+    account = _account_for(db, req.sangha_id, lock=True)
+    if not account:
+        raise HTTPException(status_code=400, detail="No Sangha Savings Account found.")
+
+    _store_balance(account, _balance(account) + principal + interest)
+
+    db.add(FundRepayment(
+        request_id=req.id, sangha_id=req.sangha_id, member_id=req.member_id,
+        principal=principal, interest=interest, is_on_time=is_on_time, recorded_by=user.id,
+    ))
+    if principal > 0:
+        db.add(FundTransaction(sangha_id=req.sangha_id, member_id=req.member_id, request_id=req.id,
+                               kind="repayment", amount=principal, created_by=user.id))
+    if interest > 0:
+        db.add(FundTransaction(sangha_id=req.sangha_id, member_id=req.member_id, request_id=req.id,
+                               kind="interest", amount=interest, created_by=user.id))
+
+    remaining = outstanding - principal
+    if remaining <= 0:
+        req.status = FundRequestStatus.completed
+        req.completed_at = datetime.utcnow()
+    else:
+        req.status = FundRequestStatus.repaying
+
+    _notify_user(
+        db, user.id, req.member_id, "Payment confirmed",
+        f"Your payment of ₹{principal + interest:,.2f} has been received and recorded. "
+        f"Remaining principal: ₹{remaining:,.2f}.",
+        req.sangha_id,
+    )
+    return {"status": req.status.value, "remaining": float(remaining)}
+
+
+def _payments_query(db: Session, user: User):
+    if user.role not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Only admin and superadmin can view payments.")
+    q = (
+        db.query(FundPayment, Sanghas, User)
+        .join(Sanghas, Sanghas.id == FundPayment.sangha_id)
+        .join(User, User.id == FundPayment.member_id)
+        .filter(FundPayment.member_id != user.id)
+    )
+    if user.role == "admin":
+        q = q.filter(Sanghas.admin_id == user.id)
+    return q
+
+
+def _staff_payment(db: Session, current_user_id, payment_id: int):
+    user = _load_user(db, current_user_id)
+    if user.role not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Only admin and superadmin can do this.")
+
+    pay = db.query(FundPayment).filter(FundPayment.id == payment_id).with_for_update().first()
+    if not pay:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+
+    sangha = db.query(Sanghas).filter(Sanghas.id == pay.sangha_id).first()
+    if user.role == "admin" and (not sangha or sangha.admin_id != user.id):
+        raise HTTPException(status_code=403, detail="You do not manage this Sangha.")
+    if pay.member_id == user.id:
+        raise HTTPException(status_code=403, detail="You cannot act on your own payment.")
+    if pay.status != "Pending":
+        raise HTTPException(status_code=400, detail="This payment has already been reviewed.")
+    return user, pay
+
+
+# ---------------- member: report a payment ----------------
+@app.post("/sangha-savings/payments")
+def create_fund_payment(
+    payload: FundPaymentCreate,
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user = _load_user(db, current_user_id)
+    if user.role != "member":
+        raise HTTPException(status_code=403, detail="Only members can make payments.")
+
+    target = next((d for d in _member_debts(db, user.id) if d["req"].id == payload.request_id), None)
+    if not target:
+        raise HTTPException(status_code=400, detail="That debt was not found or is already fully repaid.")
+
+    due = target["interest"] if payload.kind == "interest" else target["outstanding"]
+    if due <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No interest is due on this debt right now." if payload.kind == "interest"
+            else "Nothing is outstanding on this debt.",
+        )
+    if payload.amount > due:
+        raise HTTPException(status_code=422, detail=f"The most you can pay now is ₹{due:,.2f}.")
+
+    req = target["req"]
+    sangha = db.query(Sanghas).filter(Sanghas.id == req.sangha_id).first()
+
+    pay = FundPayment(
+        request_id=req.id, sangha_id=req.sangha_id, member_id=user.id,
+        kind=payload.kind, amount=payload.amount, reference=payload.reference.strip(), status="Pending",
+    )
+    db.add(pay)
+    db.flush()
+
+    if sangha and sangha.admin_id:
+        _notify_user(
+            db, user.id, sangha.admin_id, "Payment to confirm",
+            f"{user.fullname} reports paying ₹{payload.amount:,.2f} as {payload.kind} "
+            f"(reference {pay.reference}). Please confirm once the money is received.",
+            req.sangha_id,
+        )
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"You already have a {payload.kind} payment waiting for confirmation.")
+
+    return {"message": "Payment submitted. It will be recorded once the admin confirms it.", "paymentId": pay.id}
+
+
+# ---------------- admin: list, confirm, reject ----------------
+@app.get("/sangha-savings/payments/pending")
+def list_pending_fund_payments(
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user = _load_user(db, current_user_id)
+    rows = (
+        _payments_query(db, user)
+        .filter(FundPayment.status == "Pending")
+        .order_by(FundPayment.created_at.asc())
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "id": p.id,
+                "requestId": p.request_id,
+                "memberName": m.fullname,
+                "sanghaName": s.name,
+                "kind": p.kind,
+                "amount": float(p.amount),
+                "reference": p.reference,
+                "createdAt": p.created_at.isoformat(),
+            }
+            for p, s, m in rows
+        ]
+    }
+
+
+@app.post("/sangha-savings/payments/{payment_id}/confirm")
+def confirm_fund_payment(
+    payment_id: int,
+    payload: FundPaymentConfirm,
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user, pay = _staff_payment(db, current_user_id, payment_id)
+    req = db.query(FundRequest).filter(FundRequest.id == pay.request_id).with_for_update().first()
+
+    principal = pay.amount if pay.kind == "principal" else ZERO
+    interest = pay.amount if pay.kind == "interest" else ZERO
+    result = _apply_repayment(db, user, req, _d(principal), _d(interest), payload.is_on_time)
+
+    pay.status = "Confirmed"
+    pay.reviewed_by = user.id
+    pay.reviewed_at = datetime.utcnow()
+    db.commit()
+    return {"detail": "Payment confirmed.", **result}
+
+
+@app.post("/sangha-savings/payments/{payment_id}/reject")
+def reject_fund_payment(
+    payment_id: int,
+    payload: FundPaymentReject,
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user, pay = _staff_payment(db, current_user_id, payment_id)
+    pay.status = "Rejected"
+    pay.rejection_reason = payload.reason.strip()
+    pay.reviewed_by = user.id
+    pay.reviewed_at = datetime.utcnow()
+
+    _notify_user(
+        db, user.id, pay.member_id, "Payment not received",
+        f"Your {pay.kind} payment of ₹{pay.amount:,.2f} (reference {pay.reference}) could not be "
+        f"confirmed.\n\nReason: {pay.rejection_reason}\n\nPlease check the reference and try again.",
+        pay.sangha_id,
+    )
+    db.commit()
+    return {"detail": "Payment rejected."}
+
+
+# =====================================================================
+# SANGHA CONTRIBUTIONS (every member, every day, debt or not)
+# =====================================================================
+
+CONTRIBUTION_PER_DAY = Decimal("100")   # Sangha rule: change here if the rule changes
+
+
+def _today_ist() -> date:
+    """Today's date in India, so a payment at 7 AM IST is not treated as yesterday."""
+    return (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
+
+
+# ---------------- member: this month's calendar ----------------
+@app.get("/sangha-savings/contributions")
+def get_my_contributions(
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user = _load_user(db, current_user_id)
+    if user.role != "member":
+        raise HTTPException(status_code=403, detail="Only members have contributions.")
+
+    today = _today_ist()
+    n = calendar.monthrange(today.year, today.month)[1]
+    first, last = today.replace(day=1), today.replace(day=n)
+
+    rows = (
+        db.query(Contribution)
+        .filter(
+            Contribution.member_id == user.id,
+            Contribution.status.in_(("Pending", "Confirmed")),
+            Contribution.for_date >= first,
+            Contribution.for_date <= last,
+        )
+        .all()
+    )
+    by_date = {r.for_date: r.status for r in rows}
+
+    days, due_days = [], 0
+    for i in range(1, n + 1):
+        d = today.replace(day=i)
+        st = by_date.get(d)
+        if st == "Confirmed":
+            state = "paid"
+        elif st == "Pending":
+            state = "waiting"
+        elif d < today:
+            state = "missed"
+        elif d == today:
+            state = "due"
+        else:
+            state = "upcoming"
+        if state in ("missed", "due"):
+            due_days += 1
+        days.append({"date": d.isoformat(), "day": i, "state": state})
+
+    paid_days = sum(1 for x in days if x["state"] == "paid")
+    paid_amount = sum((_d(r.amount) for r in rows if r.status == "Confirmed"), ZERO)
+
+    year_total = (
+        db.query(func.coalesce(func.sum(Contribution.amount), 0))
+        .filter(
+            Contribution.member_id == user.id,
+            Contribution.status == "Confirmed",
+            Contribution.for_date >= today.replace(month=1, day=1),
+        )
+        .scalar()
+    )
+
+    # History, grouped by the payment (batch) the member made
+    all_rows = (
+        db.query(Contribution)
+        .filter(Contribution.member_id == user.id)
+        .order_by(Contribution.created_at.desc())
+        .limit(300)
+        .all()
+    )
+    batches: dict = {}
+    for r in all_rows:
+        b = batches.setdefault(r.batch_id, {
+            "batchId": r.batch_id, "reference": r.reference, "amount": ZERO, "days": [],
+            "status": r.status, "createdAt": r.created_at.isoformat(),
+            "rejectionReason": r.rejection_reason,
+        })
+        b["amount"] += _d(r.amount)
+        b["days"].append(r.for_date.isoformat())
+    history = []
+    for b in list(batches.values())[:50]:
+        b["days"].sort()
+        history.append({**b, "amount": float(b["amount"])})
+
+    account = _account_for(db, user.sangha_id) if user.sangha_id else None
+    blocker = None
+    if not user.sangha_id:
+        blocker = "You are not currently assigned to a Sangha."
+    elif not account or account.status != "Active":
+        blocker = "No active Sangha Savings Account is available."
+
+    return {
+        "month": today.strftime("%B %Y"),
+        "today": today.isoformat(),
+        "daysInMonth": n,
+        "dailyAmount": float(CONTRIBUTION_PER_DAY),
+        "monthlyAmount": float(CONTRIBUTION_PER_DAY * n),
+        "days": days,
+        "daysPaid": paid_days,
+        "paidAmount": float(paid_amount),
+        "remaining": float(CONTRIBUTION_PER_DAY * n - paid_amount),
+        "dueNow": float(CONTRIBUTION_PER_DAY * due_days),
+        "yearTotal": float(_d(year_total)),
+        "history": history,
+        "canPay": blocker is None,
+        "payBlocker": blocker,
+    }
+
+
+# ---------------- member: report a contribution payment ----------------
+@app.post("/sangha-savings/contributions")
+def create_contribution(
+    payload: ContributionCreate,
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user = _load_user(db, current_user_id)
+    if user.role != "member":
+        raise HTTPException(status_code=403, detail="Only members can pay contributions.")
+    if not user.sangha_id:
+        raise HTTPException(status_code=400, detail="You are not currently assigned to a Sangha.")
+
+    sangha = db.query(Sanghas).filter(Sanghas.id == user.sangha_id).first()
+    account = _account_for(db, user.sangha_id)
+    if not sangha or not account or account.status != "Active":
+        raise HTTPException(status_code=400, detail="No active Sangha Savings Account is available.")
+
+    today = _today_ist()
+    dates = sorted(set(payload.dates))
+    for d in dates:
+        if d.year != today.year or d.month != today.month:
+            raise HTTPException(status_code=422, detail="You can only pay for days in the current month.")
+        if d > today:
+            raise HTTPException(status_code=422, detail="You cannot pay for a future day.")
+
+    taken = (
+        db.query(Contribution.id)
+        .filter(
+            Contribution.member_id == user.id,
+            Contribution.for_date.in_(dates),
+            Contribution.status.in_(("Pending", "Confirmed")),
+        )
+        .first()
+    )
+    if taken:
+        raise HTTPException(status_code=409, detail="Some of these days are already paid or waiting for confirmation.")
+
+    now = datetime.utcnow()
+    batch_id = str(uuid.uuid4())
+    for d in dates:
+        db.add(Contribution(
+            batch_id=batch_id, member_id=user.id, sangha_id=sangha.id, for_date=d,
+            amount=CONTRIBUTION_PER_DAY, reference=payload.reference.strip(),
+            status="Pending", created_at=now,
+        ))
+
+    total = CONTRIBUTION_PER_DAY * len(dates)
+    if sangha.admin_id:
+        _notify_user(
+            db, user.id, sangha.admin_id, "Contribution to confirm",
+            f"{user.fullname} reports paying a Sangha contribution of ₹{total:,.2f} for {len(dates)} day(s) "
+            f"(reference {payload.reference.strip()}). Please confirm once the money is received.",
+            sangha.id,
+        )
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Some of these days are already paid or waiting for confirmation.")
+
+    return {"message": "Contribution submitted. It counts once the admin confirms it.", "batchId": batch_id}
+
+
+# ---------------- admin: list, confirm, reject ----------------
+def _contributions_query(db: Session, user: User):
+    if user.role not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Only admin and superadmin can view contributions.")
+    q = (
+        db.query(Contribution, Sanghas, User)
+        .join(Sanghas, Sanghas.id == Contribution.sangha_id)
+        .join(User, User.id == Contribution.member_id)
+        .filter(Contribution.member_id != user.id)
+    )
+    if user.role == "admin":
+        q = q.filter(Sanghas.admin_id == user.id)
+    return q
+
+
+@app.get("/sangha-savings/contributions/pending")
+def list_pending_contributions(
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user = _load_user(db, current_user_id)
+    rows = (
+        _contributions_query(db, user)
+        .filter(Contribution.status == "Pending")
+        .order_by(Contribution.created_at.asc(), Contribution.for_date.asc())
+        .all()
+    )
+    batches: dict = {}
+    for c, s, m in rows:
+        b = batches.setdefault(c.batch_id, {
+            "batchId": c.batch_id, "memberName": m.fullname, "sanghaName": s.name,
+            "reference": c.reference, "amount": ZERO, "days": [], "createdAt": c.created_at.isoformat(),
+        })
+        b["amount"] += _d(c.amount)
+        b["days"].append(c.for_date.isoformat())
+    return {"items": [{**b, "amount": float(b["amount"])} for b in batches.values()]}
+
+
+def _staff_contribution_batch(db: Session, current_user_id, batch_id: str):
+    user = _load_user(db, current_user_id)
+    if user.role not in ("admin", "superadmin"):
+        raise HTTPException(status_code=403, detail="Only admin and superadmin can do this.")
+
+    rows = (
+        db.query(Contribution)
+        .filter(Contribution.batch_id == batch_id, Contribution.status == "Pending")
+        .with_for_update()
+        .all()
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Contribution not found or already reviewed.")
+
+    sangha = db.query(Sanghas).filter(Sanghas.id == rows[0].sangha_id).first()
+    if user.role == "admin" and (not sangha or sangha.admin_id != user.id):
+        raise HTTPException(status_code=403, detail="You do not manage this Sangha.")
+    if rows[0].member_id == user.id:
+        raise HTTPException(status_code=403, detail="You cannot act on your own contribution.")
+    return user, rows
+
+
+@app.post("/sangha-savings/contributions/{batch_id}/confirm")
+def confirm_contribution(
+    batch_id: str,
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user, rows = _staff_contribution_batch(db, current_user_id, batch_id)
+    total = sum((_d(r.amount) for r in rows), ZERO)
+
+    account = _account_for(db, rows[0].sangha_id, lock=True)
+    if not account:
+        raise HTTPException(status_code=400, detail="No Sangha Savings Account found.")
+
+    _store_balance(account, _balance(account) + total)   # contributions grow the Sangha fund
+
+    now = datetime.utcnow()
+    for r in rows:
+        r.status = "Confirmed"
+        r.reviewed_by = user.id
+        r.reviewed_at = now
+
+    _notify_user(
+        db, user.id, rows[0].member_id, "Contribution confirmed",
+        f"Your Sangha contribution of ₹{total:,.2f} for {len(rows)} day(s) has been received. Thank you.",
+        rows[0].sangha_id,
+    )
+    db.commit()
+    return {"detail": "Contribution confirmed.", "amount": float(total)}
+
+
+@app.post("/sangha-savings/contributions/{batch_id}/reject")
+def reject_contribution(
+    batch_id: str,
+    payload: FundPaymentReject,
+    db: Session = Depends(get_db),
+    current_user_id=Depends(get_current_user),
+):
+    user, rows = _staff_contribution_batch(db, current_user_id, batch_id)
+    total = sum((_d(r.amount) for r in rows), ZERO)
+
+    now = datetime.utcnow()
+    for r in rows:
+        r.status = "Rejected"
+        r.rejection_reason = payload.reason.strip()
+        r.reviewed_by = user.id
+        r.reviewed_at = now
+
+    _notify_user(
+        db, user.id, rows[0].member_id, "Contribution not received",
+        f"Your contribution of ₹{total:,.2f} (reference {rows[0].reference}) could not be confirmed.\n\n"
+        f"Reason: {payload.reason.strip()}\n\nPlease check the reference and try again.",
+        rows[0].sangha_id,
+    )
+    db.commit()
+    return {"detail": "Contribution rejected."}
+
 
 Base.metadata.create_all(bind=engine)
 

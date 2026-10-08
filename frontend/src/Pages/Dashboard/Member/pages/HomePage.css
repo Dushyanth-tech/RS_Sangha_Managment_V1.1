@@ -343,6 +343,12 @@
   font-size: 13px;
 }
 
+.hp-card__interest {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--danger, #c83c55);
+}
+
 /* ---------- Responsive ---------- */
 @media (max-width: 1100px) {
   .hp-cards {

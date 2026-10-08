@@ -202,6 +202,13 @@ export default function HomePage({ user = {}, onNavigate }) {
           <div className="hp-card__sub">
             {!loading && debt === 0 ? "No Active Loan" : "Outstanding Debt"}
           </div>
+          {!loading && debt > 0 && (
+            <div className="hp-card__interest">
+              {Number(summary?.interestDue) > 0
+                ? `+ ${rupees(summary.interestDue)} interest (${summary.interestRate}%) due`
+                : `Interest (${summary?.interestRate ?? 2}%) paid this month`}
+            </div>
+          )}
         </article>
       </section>
 
@@ -273,9 +280,7 @@ export default function HomePage({ user = {}, onNavigate }) {
               ))}
 
               {members.length === 0 && (
-                <li className="hp-members__row hp-muted">
-                  No members found.
-                </li>
+                <li className="hp-members__row hp-muted">No members found.</li>
               )}
             </ul>
 

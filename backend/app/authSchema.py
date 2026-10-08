@@ -226,3 +226,22 @@ class FundRepaymentCreate(BaseModel):
     principal: Decimal = Field(..., ge=0, max_digits=12, decimal_places=2)
     interest: Decimal = Field(0, ge=0, max_digits=12, decimal_places=2)
     is_on_time: bool = True
+
+
+class FundPaymentCreate(BaseModel):
+    request_id: int
+    kind: Literal["interest", "principal"]
+    amount: Decimal = Field(..., gt=0, max_digits=12, decimal_places=2)
+    reference: str = Field(..., min_length=6, max_length=60)
+
+
+class FundPaymentConfirm(BaseModel):
+    is_on_time: bool = True
+
+
+class FundPaymentReject(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=255)
+
+class ContributionCreate(BaseModel):
+    dates: list[date] = Field(..., min_length=1, max_length=31)
+    reference: str = Field(..., min_length=6, max_length=60)

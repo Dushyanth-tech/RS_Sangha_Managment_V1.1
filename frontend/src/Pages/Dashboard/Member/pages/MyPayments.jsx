@@ -1,20 +1,19 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Wallet,
-  CalendarDays,
   Percent,
+  Banknote,
+  HandCoins,
   Landmark,
-  ArrowRight,
   Download,
   Search,
-  CheckCircle2,
   Receipt,
-  PiggyBank,
-  HandCoins,
-  TrendingUp,
-  Banknote,
-  CreditCard,
+  ArrowRight,
+  X,
+  Loader2,
   Clock,
+  PiggyBank,
+  CheckCircle2,
 } from "lucide-react";
 
 import api from "../../../../api/axiosInstance";
@@ -40,6 +39,14 @@ const fmtDate = (iso) =>
       })
     : "—";
 
+const dayShort = (iso) =>
+  new Date(`${iso}T00:00:00`).toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+  });
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 const errorText = (err, fallback) => {
   if (err?.response?.status === 401) {
     return "Your session has expired. Please log in again.";
@@ -49,20 +56,20 @@ const errorText = (err, fallback) => {
   return (typeof detail === "string" && detail) || fallback;
 };
 
-const pad = (n) => String(n).padStart(2, "0");
-
 const FILTERS = ["All", "Contributions", "Interest", "Principal", "Pending", "Failed"];
 
-const OPTIONS = [
-  { key: "contribution", title: "Contribution", desc: "Pay daily/monthly contribution", icon: PiggyBank },
-  { key: "interest", title: "Interest Payment", desc: "Interest on emergency funds / loans", icon: Percent },
-  { key: "principal", title: "Principal Repayment", desc: "Repay borrowed amount", icon: HandCoins },
-  { key: "other", title: "Other Payment", desc: "View other payment options", icon: CreditCard },
-];
+const FILTER_TEST = {
+  All: () => true,
+  Contributions: (p) => p.kind === "Contribution",
+  Interest: (p) => p.kind === "Interest",
+  Principal: (p) => p.kind === "Principal",
+  Pending: (p) => p.status === "Pending",
+  Failed: (p) => p.status === "Failed",
+};
 
 const STATUS_TONE = { Paid: "green", Pending: "orange", Failed: "red" };
 
-// Backend transaction -> payment row. Money RECEIVED is not a payment, so it is filtered out below.
+// A confirmed repayment from the ledger. Money RECEIVED is not a payment, so it is filtered out earlier.
 const toPayment = (t) => {
   const label = t.type || "";
   const kind = label.startsWith("Repayment")
@@ -81,15 +88,6 @@ const toPayment = (t) => {
   };
 };
 
-const FILTER_TEST = {
-  All: () => true,
-  Contributions: (p) => p.kind === "Contribution",
-  Interest: (p) => p.kind === "Interest",
-  Principal: (p) => p.kind === "Principal",
-  Pending: (p) => p.status === "Pending",
-  Failed: (p) => p.status === "Failed",
-};
-
 /* ====================================================================
    SMALL UI PIECES
 ==================================================================== */
@@ -102,10 +100,11 @@ const Badge = ({ tone = "blue", children }) => (
   <span className={`mp-badge mp-badge--${tone}`}>{children}</span>
 );
 
-const Empty = ({ text }) => (
+const Empty = ({ icon: Icon = Receipt, text, children }) => (
   <div className="mp-empty">
-    <Receipt size={22} />
+    <Icon size={22} />
     <p>{text}</p>
+    {children}
   </div>
 );
 
@@ -120,25 +119,22 @@ const ErrorBox = ({ text, onRetry }) => (
   </div>
 );
 
-const Card = ({ className = "", title, subtitle, action, children }) => (
+const Card = ({ className = "", title, subtitle, children }) => (
   <section className={`mp-card ${className}`}>
-    {title && (
-      <div className="mp-card__head">
-        <div>
-          <h2>{title}</h2>
-          {subtitle && <p>{subtitle}</p>}
-        </div>
-        {action}
+    <div className="mp-card__head">
+      <div>
+        <h2>{title}</h2>
+        {subtitle && <p>{subtitle}</p>}
       </div>
-    )}
+    </div>
     {children}
   </section>
 );
 
-function Stat({ icon: Icon, label, value, desc, loading }) {
+function Stat({ icon: Icon, label, value, desc, loading, tone }) {
   return (
     <article className="mp-stat">
-      <span className="mp-stat__icon">
+      <span className={`mp-stat__icon ${tone ? `mp-stat__icon--${tone}` : ""}`}>
         <Icon size={18} />
       </span>
       <span className="mp-stat__label">{label}</span>
@@ -152,11 +148,11 @@ function Stat({ icon: Icon, label, value, desc, loading }) {
   );
 }
 
-function KV({ label, value, loading }) {
+function KV({ label, value }) {
   return (
     <div className="mp-kv__item">
       <dt>{label}</dt>
-      <dd className={value === NA ? "mp-na" : ""}>{loading ? <Skel w="60%" h={14} /> : value}</dd>
+      <dd>{value || "—"}</dd>
     </div>
   );
 }
@@ -165,23 +161,9 @@ function KV({ label, value, loading }) {
    CONTRIBUTION CALENDAR
 ==================================================================== */
 
-function Calendar({ year, month, paidDays = [], missedDays = [] }) {
-  const paid = new Set(paidDays);
-  const missed = new Set(missedDays);
-  const firstWeekday = new Date(year, month, 1).getDay();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
+function Calendar({ days, selected, onToggle }) {
+  const blanks = new Date(`${days[0].date}T00:00:00`).getDay();
   const weekdays = ["S", "M", "T", "W", "T", "F", "S"];
-
-  const cells = [];
-  for (let i = 0; i < firstWeekday; i += 1) cells.push(<span key={`b${i}`} className="mp-cal__blank" />);
-  for (let d = 1; d <= daysInMonth; d += 1) {
-    const state = paid.has(d) ? "paid" : missed.has(d) ? "missed" : "pending";
-    cells.push(
-      <span key={d} className={`mp-cal__day mp-cal__day--${state}`} title={`${d}: ${state}`}>
-        {d}
-      </span>,
-    );
-  }
 
   return (
     <div>
@@ -191,45 +173,294 @@ function Calendar({ year, month, paidDays = [], missedDays = [] }) {
             {w}
           </span>
         ))}
-        {cells}
+        {Array.from({ length: blanks }).map((_, i) => (
+          <span key={`b${i}`} />
+        ))}
+        {days.map((d) => {
+          const payable = d.state === "missed" || d.state === "due";
+          const isSelected = selected.has(d.date);
+          const cls = `mp-cal__day mp-cal__day--${d.state} ${isSelected ? "mp-cal__day--sel" : ""}`;
+
+          return payable ? (
+            <button
+              key={d.date}
+              type="button"
+              className={cls}
+              aria-pressed={isSelected}
+              aria-label={`${dayShort(d.date)}, ${d.state === "missed" ? "missed" : "due today"}`}
+              onClick={() => onToggle(d.date)}
+            >
+              {d.day}
+            </button>
+          ) : (
+            <span key={d.date} className={cls}>
+              {d.day}
+            </span>
+          );
+        })}
       </div>
+
       <ul className="mp-legend">
         <li><i className="mp-dot mp-dot--paid" /> Paid</li>
-        <li><i className="mp-dot mp-dot--pending" /> Pending</li>
+        <li><i className="mp-dot mp-dot--waiting" /> Waiting for admin</li>
         <li><i className="mp-dot mp-dot--missed" /> Missed</li>
+        <li><i className="mp-dot mp-dot--due" /> Due / upcoming</li>
       </ul>
+    </div>
+  );
+}
+
+function ContributionCard({
+  con,
+  loading,
+  error,
+  onRetry,
+  selected,
+  onToggle,
+  onSelectAll,
+  onClear,
+  onPay,
+}) {
+  const payable = (con?.days ?? []).filter((d) => d.state === "missed" || d.state === "due");
+  const count = selected.size;
+  const allSelected = payable.length > 0 && count === payable.length;
+  const pct = con ? Math.min(Math.round((con.daysPaid / con.daysInMonth) * 100), 100) : 0;
+
+  return (
+    <Card
+      className="mp-contrib"
+      title="Sangha Contribution"
+      subtitle={
+        con
+          ? `${con.month} · every member pays ${rupees(con.dailyAmount)} a day, with or without a debt`
+          : "Every member pays this, with or without a debt"
+      }
+    >
+      {loading ? (
+        <Skel h={260} />
+      ) : error ? (
+        <ErrorBox text={error} onRetry={onRetry} />
+      ) : !con ? null : (
+        <>
+          <dl className="mp-kv mp-kv--4">
+            <KV label="Daily Contribution" value={rupees(con.dailyAmount)} />
+            <KV label="Days Paid" value={`${con.daysPaid} / ${con.daysInMonth}`} />
+            <KV label="Paid This Month" value={rupees(con.paidAmount)} />
+            <KV label="Remaining" value={rupees(con.remaining)} />
+          </dl>
+
+          <div className="mp-progress">
+            <div className="mp-progress__top">
+              <span>Month progress</span>
+              <strong>{pct}%</strong>
+            </div>
+            <div className="mp-bar" role="img" aria-label={`${pct}% of the month paid`}>
+              <span style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+
+          <Calendar days={con.days} selected={selected} onToggle={onToggle} />
+
+          {con.payBlocker && <p className="mp-note">{con.payBlocker}</p>}
+
+          {payable.length > 0 ? (
+            <>
+              <p className="mp-hint">Tap the red or highlighted days to choose what you are paying for.</p>
+              <div className="mp-contrib__actions">
+                <button
+                  type="button"
+                  className="mp-btn"
+                  disabled={!con.canPay}
+                  onClick={allSelected ? onClear : onSelectAll}
+                >
+                  {allSelected ? "Clear selection" : `Select all due days (${payable.length})`}
+                </button>
+                <button
+                  type="button"
+                  className="mp-btn mp-btn--primary"
+                  disabled={!con.canPay || count === 0}
+                  onClick={onPay}
+                >
+                  {count > 0
+                    ? `Pay ${rupees(count * con.dailyAmount)} for ${plural(count, "day")}`
+                    : "Choose days to pay"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="mp-note mp-note--ok">You are up to date for this month.</p>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+/* ====================================================================
+   PAY MODAL (member reports a payment; the admin confirms it)
+   Used for contributions, interest and principal.
+==================================================================== */
+
+function PayModal({ title, subtitle, amount: initial, editable, max, account, submit, onClose, onDone }) {
+  const [amount, setAmount] = useState(String(initial));
+  const [reference, setReference] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [sent, setSent] = useState(false);
+  const lock = useRef(false);
+
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && closeRef.current();
+    document.addEventListener("keydown", onKey);
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = previous;
+    };
+  }, []);
+
+  const send = async () => {
+    const n = Number(amount);
+    if (!(n > 0)) return setError("Enter an amount greater than ₹0.");
+    if (n > max) return setError(`The most you can pay now is ${rupees(max)}.`);
+    if (reference.trim().length < 6) {
+      return setError("Enter the UPI / bank transaction ID (at least 6 characters).");
+    }
+    if (lock.current) return;
+
+    lock.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await submit(n, reference.trim());
+      setSent(true);
+      onDone();
+    } catch (err) {
+      console.error("Payment failed:", err);
+      setError(errorText(err, "Unable to submit the payment."));
+      lock.current = false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mp-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="mp-modal" role="dialog" aria-modal="true" aria-label={title}>
+        <header className="mp-modal__head">
+          <div>
+            <h3>{title}</h3>
+            <p>{subtitle}</p>
+          </div>
+          <button type="button" className="mp-modal__close" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="mp-modal__body">
+          {sent ? (
+            <div className="mp-sent">
+              <CheckCircle2 size={40} />
+              <h4>Payment submitted</h4>
+              <p>
+                It shows as <b>Pending</b> until the admin confirms the money was received. You will be
+                notified.
+              </p>
+              <button type="button" className="mp-btn mp-btn--primary mp-btn--block" onClick={onClose}>
+                Done
+              </button>
+            </div>
+          ) : (
+            <>
+              {account && (
+                <div className="mp-payto">
+                  <strong>Pay to the Sangha Savings Account</strong>
+                  <span>
+                    {account.accountHolder} · {account.bank}
+                  </span>
+                  <span>
+                    A/c {account.accountNumberMasked} · IFSC {account.ifsc}
+                  </span>
+                </div>
+              )}
+
+              <label className="mp-field">
+                <span>Amount (₹)</span>
+                <input
+                  type="number"
+                  min="1"
+                  max={max}
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  readOnly={!editable}
+                  disabled={busy}
+                />
+              </label>
+              <p className="mp-hint">{editable ? `Most you can pay now: ${rupees(max)}` : "This amount is fixed."}</p>
+
+              <label className="mp-field">
+                <span>UPI / bank transaction ID</span>
+                <input
+                  type="text"
+                  maxLength={60}
+                  placeholder="Enter the reference after you pay"
+                  value={reference}
+                  onChange={(e) => setReference(e.target.value)}
+                  disabled={busy}
+                />
+              </label>
+
+              {error && <div className="mp-error">{error}</div>}
+
+              <button
+                type="button"
+                className="mp-btn mp-btn--primary mp-btn--block"
+                onClick={send}
+                disabled={busy}
+              >
+                {busy && <Loader2 size={16} className="mp-spin" />}
+                {busy ? "Submitting..." : "Submit Payment"}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
 
 /* ====================================================================
    PAGE
-   `contribution` is the plug-in point for a future contributions API:
-   { monthlyAmount, yearTotal, dailyAmount, daysPaid, daysInMonth,
-     paidAmount, remaining, paidDays: [1,2,...], missedDays: [...] }
-   Until that exists it stays null and those sections say "Not available yet".
 ==================================================================== */
 
-export default function MyPayments({ contribution = null }) {
+export default function MyPayments({ onNavigate }) {
   const [ov, setOv] = useState(null);
   const [ovError, setOvError] = useState("");
   const [hist, setHist] = useState(null);
   const [histError, setHistError] = useState("");
+  const [con, setCon] = useState(null);
+  const [conError, setConError] = useState("");
   const [loading, setLoading] = useState(true);
 
   const [filter, setFilter] = useState("All");
-  const [month, setMonth] = useState("");
   const [query, setQuery] = useState("");
-  const [selectedId, setSelectedId] = useState(null);
+  const [selected, setSelected] = useState(() => new Set());
+  const [modal, setModal] = useState(null); // { type: "contribution" | "interest" | "principal", ... }
 
   const load = useCallback(async () => {
     setLoading(true);
     setOvError("");
     setHistError("");
+    setConError("");
 
-    const [o, h] = await Promise.allSettled([
+    const [o, h, c] = await Promise.allSettled([
       api.get("/sangha-savings/overview"),
       api.get("/sangha-savings/history"),
+      api.get("/sangha-savings/contributions"),
     ]);
 
     if (o.status === "fulfilled") setOv(o.value.data);
@@ -244,6 +475,12 @@ export default function MyPayments({ contribution = null }) {
       setHistError(errorText(h.reason, "Unable to load your payment history."));
     }
 
+    if (c.status === "fulfilled") setCon(c.value.data);
+    else {
+      console.error("Contributions failed:", c.reason);
+      setConError(errorText(c.reason, "Unable to load your contributions."));
+    }
+
     setLoading(false);
   }, []);
 
@@ -255,33 +492,68 @@ export default function MyPayments({ contribution = null }) {
   const account = ov?.account;
   const sangha = ov?.sangha;
 
-  const now = new Date();
-  const monthKey = `${now.getFullYear()}-${pad(now.getMonth() + 1)}`;
-  const monthLabel = now.toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+  const rate = member?.interestRate ?? 10;
+  const debts = member?.debts ?? [];
+  const pendingPayments = member?.pendingPayments ?? [];
+  const pendingKinds = new Set(pendingPayments.map((p) => p.kind));
+  const hasDebt = (member?.outstanding ?? 0) > 0;
 
-  const payments = useMemo(
-    () => (hist?.transactions ?? []).filter((t) => t.direction === "Paid").map(toPayment),
-    [hist],
+  const payableDates = useMemo(
+    () => new Set((con?.days ?? []).filter((d) => d.state === "missed" || d.state === "due").map((d) => d.date)),
+    [con],
   );
+
+  const toggleDay = (date) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(date)) next.delete(date);
+      else next.add(date);
+      return next;
+    });
+
+  const selectedDates = [...selected].sort();
+
+  /* ---------- payment history (contributions + interest + principal) ---------- */
+  const payments = useMemo(() => {
+    const ledger = (hist?.transactions ?? []).filter((t) => t.direction === "Paid").map(toPayment);
+
+    const waiting = (hist?.payments ?? []).map((p) => ({
+      id: `p${p.id}`,
+      kind: p.kind === "interest" ? "Interest" : "Principal",
+      type: p.kind === "interest" ? "Interest" : "Principal",
+      amount: p.amount,
+      date: p.createdAt,
+      ref: p.reference,
+      status: p.status === "Rejected" ? "Failed" : "Pending",
+      payKind: p.kind,
+      requestId: p.requestId,
+      reason: p.rejectionReason,
+    }));
+
+    const contributions = (con?.history ?? []).map((b) => ({
+      id: `c${b.batchId}`,
+      kind: "Contribution",
+      type: `Contribution (${plural(b.days.length, "day")})`,
+      amount: b.amount,
+      date: b.createdAt,
+      ref: b.reference,
+      status: b.status === "Confirmed" ? "Paid" : b.status === "Rejected" ? "Failed" : "Pending",
+      payKind: "contribution",
+      dates: b.days,
+      reason: b.rejectionReason,
+    }));
+
+    return [...waiting, ...contributions, ...ledger].sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [hist, con]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return payments.filter(
       (p) =>
         FILTER_TEST[filter](p) &&
-        (!month || p.date.slice(0, 7) === month) &&
         (!q || p.ref.toLowerCase().includes(q) || p.type.toLowerCase().includes(q)),
     );
-  }, [payments, filter, month, query]);
-
-  // This month's principal + interest, from real repayment records
-  const monthPayments = payments.filter((p) => p.date.slice(0, 7) === monthKey && p.status === "Paid");
-  const principalPaid = monthPayments.filter((p) => p.kind === "Principal").reduce((s, p) => s + p.amount, 0);
-  const interestPaid = monthPayments.filter((p) => p.kind === "Interest").reduce((s, p) => s + p.amount, 0);
-  const breakdownTotal = principalPaid + interestPaid;
-  const principalShare = breakdownTotal > 0 ? (principalPaid / breakdownTotal) * 100 : 0;
-
-  const receipt = payments.find((p) => p.id === selectedId) ?? payments.find((p) => p.status === "Paid") ?? null;
+  }, [payments, filter, query]);
 
   const downloadReceipt = (p) => {
     const text = [
@@ -301,14 +573,60 @@ export default function MyPayments({ contribution = null }) {
     URL.revokeObjectURL(url);
   };
 
-  const viewReceipt = (p) => {
-    setSelectedId(p.id);
-    document.getElementById("mp-receipt")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  /* ---------- retry a rejected payment ---------- */
+  const retryTarget = (p) => {
+    if (p.payKind === "contribution") {
+      const dates = (p.dates ?? []).filter((d) => payableDates.has(d));
+      return dates.length > 0 && con?.canPay ? { type: "contribution", dates } : null;
+    }
+    const debt = debts.find((d) => d.id === p.requestId);
+    if (!debt || pendingKinds.has(p.payKind)) return null;
+    const open = p.payKind === "interest" ? debt.interest > 0 : debt.outstanding > 0;
+    return open ? { type: p.payKind, debt } : null;
   };
 
-  const outstanding = member ? member.outstanding : null;
-  const c = contribution;
-  const pct = c ? Math.min(Math.round((c.daysPaid / c.daysInMonth) * 100), 100) : 0;
+  /* ---------- the modal that is open right now ---------- */
+  const modalProps = (() => {
+    if (!modal) return null;
+
+    if (modal.type === "contribution") {
+      const total = modal.dates.length * (con?.dailyAmount ?? 0);
+      return {
+        key: `con-${modal.dates.join(",")}`,
+        title: "Pay Contribution",
+        subtitle: `${plural(modal.dates.length, "day")} × ${rupees(con?.dailyAmount)} to the Sangha`,
+        amount: total,
+        max: total,
+        editable: false,
+        submit: (_n, reference) =>
+          api.post("/sangha-savings/contributions", { dates: modal.dates, reference }),
+      };
+    }
+
+    const d = modal.debt;
+    const isInterest = modal.type === "interest";
+    const due = isInterest ? d.interest : d.outstanding;
+    return {
+      key: `${modal.type}-${d.id}`,
+      title: isInterest ? "Pay Interest" : "Pay Principal",
+      subtitle: isInterest
+        ? `${rate}% monthly interest on ${rupees(d.outstanding)}`
+        : `Repay part or all of ${rupees(d.outstanding)}`,
+      amount: due,
+      max: due,
+      editable: !isInterest,
+      submit: (n, reference) =>
+        api.post("/sangha-savings/payments", {
+          request_id: d.id,
+          kind: modal.type,
+          amount: n,
+          reference,
+        }),
+    };
+  })();
+
+  const waitingContributions = (con?.history ?? []).filter((b) => b.status === "Pending");
+  const hasWaiting = pendingPayments.length > 0 || waitingContributions.length > 0;
 
   return (
     <div className="mp">
@@ -319,286 +637,299 @@ export default function MyPayments({ contribution = null }) {
         </span>
         <div>
           <h1>My Payments</h1>
-          <p>Track your contributions, interest, repayments and complete payment history.</p>
+          <p>Your daily Sangha contribution, any interest and debt, and every payment you have made.</p>
         </div>
       </header>
 
       {ovError && <ErrorBox text={ovError} onRetry={load} />}
 
+      {/* ---------- Waiting for admin ---------- */}
+      {hasWaiting && (
+        <div className="mp-banner" role="status">
+          <Clock size={20} />
+          <div>
+            {waitingContributions.map((b) => (
+              <p key={b.batchId}>
+                Your <b>{rupees(b.amount)}</b> contribution for {plural(b.days.length, "day")} (ref{" "}
+                <b>{b.reference}</b>) is waiting for the admin to confirm.
+              </p>
+            ))}
+            {pendingPayments.map((p) => (
+              <p key={p.id}>
+                Your <b>{rupees(p.amount)}</b> {p.kind} payment (ref <b>{p.reference}</b>) is waiting for
+                the admin to confirm.
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* ---------- Summary ---------- */}
       <div className="mp-stats">
-        <Stat icon={CalendarDays} label="Monthly Contribution" value={rupees(c?.monthlyAmount)} desc="As per Sangha rules" loading={loading} />
-        <Stat icon={TrendingUp} label="Total Contributions" value={rupees(c?.yearTotal)} desc="This year" loading={loading} />
-        <Stat icon={Percent} label="Interest Paid" value={rupees(member?.totalInterestPaid)} desc="All time" loading={loading} />
-        <Stat icon={Banknote} label="Outstanding Amount" value={rupees(outstanding)} desc="Principal outstanding" loading={loading} />
+        <Stat
+          icon={PiggyBank}
+          label="Contribution Due"
+          value={con ? rupees(con.dueNow) : NA}
+          desc="Unpaid days up to today"
+          tone={con?.dueNow > 0 ? "red" : undefined}
+          loading={loading}
+        />
+        <Stat
+          icon={Percent}
+          label="Interest Due"
+          value={rupees(member ? member.interestDue : null)}
+          desc={hasDebt ? `${rate}% per month` : "No active debt"}
+          loading={loading}
+        />
+        <Stat
+          icon={Banknote}
+          label="Outstanding Debt"
+          value={rupees(member ? member.outstanding : null)}
+          desc="Principal you still owe"
+          tone={hasDebt ? "red" : undefined}
+          loading={loading}
+        />
+        <Stat
+          icon={Wallet}
+          label="Contributions Paid"
+          value={con ? rupees(con.yearTotal) : NA}
+          desc="This year"
+          tone="green"
+          loading={loading}
+        />
       </div>
 
-      <div className="mp-body">
-        <div className="mp-main">
-          <div className="mp-row">
-            {/* ---------- Current month ---------- */}
-            <Card className="mp-o2" title="Current Month Contribution" subtitle={monthLabel}>
-              {!c ? (
-                <Empty text="Contribution tracking is not available yet." />
-              ) : (
-                <>
-                  <dl className="mp-kv mp-kv--4">
-                    <KV label="Daily Contribution" value={rupees(c.dailyAmount)} />
-                    <KV label="Days Paid" value={`${c.daysPaid} / ${c.daysInMonth}`} />
-                    <KV label="Paid Amount" value={rupees(c.paidAmount)} />
-                    <KV label="Remaining" value={rupees(c.remaining)} />
-                  </dl>
-                  <div className="mp-progress" aria-label={`${pct}% paid`}>
-                    <div className="mp-progress__top">
-                      <span>Progress</span>
-                      <strong>{pct}%</strong>
-                    </div>
-                    <div className="mp-bar">
-                      <span style={{ width: `${pct}%` }} />
-                    </div>
-                  </div>
-                  <Calendar
-                    year={now.getFullYear()}
-                    month={now.getMonth()}
-                    paidDays={c.paidDays}
-                    missedDays={c.missedDays}
-                  />
-                </>
-              )}
-            </Card>
+      {/* ---------- Contribution + debts, and where to pay ---------- */}
+      <div className="mp-grid">
+        <div className="mp-col">
+          <ContributionCard
+            con={con}
+            loading={loading}
+            error={conError}
+            onRetry={load}
+            selected={selected}
+            onToggle={toggleDay}
+            onSelectAll={() => setSelected(new Set(payableDates))}
+            onClear={() => setSelected(new Set())}
+            onPay={() => setModal({ type: "contribution", dates: selectedDates })}
+          />
 
-            {/* ---------- Quick pay ---------- */}
-            <Card className="mp-o3 mp-quick" title="Quick Pay" subtitle="Pay your contribution for today">
-              <dl className="mp-kv">
-                <KV label="Amount" value={rupees(c?.dailyAmount)} />
-                <KV label="Payment Type" value="Contribution" />
-              </dl>
-              <button type="button" className="mp-btn mp-btn--primary mp-btn--block" disabled>
-                {c?.dailyAmount != null ? `Pay ${rupees(c.dailyAmount)}` : "Pay"}
-              </button>
-              <p className="mp-hint">Online payment is not available yet.</p>
-            </Card>
-          </div>
-
-          {/* ---------- Payment options ---------- */}
-          <Card className="mp-o5" title="Payment Options">
-            <div className="mp-options">
-              {OPTIONS.map(({ key, title, desc, icon: Icon }) => (
-                <button key={key} type="button" className="mp-option" disabled>
-                  <span className="mp-option__icon">
-                    <Icon size={20} />
-                  </span>
-                  <strong>{title}</strong>
-                  <small>{desc}</small>
-                </button>
-              ))}
-            </div>
-            <p className="mp-hint">Payments are not available yet.</p>
-          </Card>
-
-          {/* ---------- History ---------- */}
-          <Card className="mp-o8" title="Payment History" subtitle="Track all your past payments.">
-            <div className="mp-filters" role="group" aria-label="Filter payments">
-              {FILTERS.map((f) => (
-                <button
-                  key={f}
-                  type="button"
-                  className={`mp-chip ${filter === f ? "mp-chip--active" : ""}`}
-                  onClick={() => setFilter(f)}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
-
-            <div className="mp-tools">
-              <label className="mp-field">
-                <span>Month</span>
-                <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
-              </label>
-              <label className="mp-field mp-field--search">
-                <span>Search</span>
-                <div className="mp-search">
-                  <Search size={16} />
-                  <input
-                    type="search"
-                    placeholder="Search transaction"
-                    value={query}
-                    onChange={(e) => setQuery(e.target.value)}
-                  />
-                </div>
-              </label>
-            </div>
-
+          <Card
+            className="mp-debts"
+            title="Your Debts"
+            subtitle={`Interest is ${rate}% per month on what you still owe`}
+          >
             {loading ? (
-              <Skel h={120} />
-            ) : histError ? (
-              <ErrorBox text={histError} onRetry={load} />
-            ) : filtered.length === 0 ? (
-              <Empty text={payments.length === 0 ? "No payments yet." : "No payments match your filters."} />
+              <Skel h={150} />
+            ) : debts.length === 0 ? (
+              <Empty icon={CheckCircle2} text="You have no outstanding debt, so only your daily contribution applies.">
+                {onNavigate && (
+                  <button type="button" className="mp-btn" onClick={() => onNavigate("savings")}>
+                    <HandCoins size={16} /> Sangha Savings
+                  </button>
+                )}
+              </Empty>
             ) : (
-              <>
-                <div className="mp-hrow mp-hrow--head" aria-hidden="true">
-                  <span>Date</span>
-                  <span>Type</span>
-                  <span>Amount</span>
-                  <span>Reference ID</span>
-                  <span>Status</span>
-                  <span>Action</span>
-                </div>
-                <ul className="mp-hlist">
-                  {filtered.map((p) => (
-                    <li key={p.id} className="mp-hrow">
-                      <span className="mp-h-date">{fmtDate(p.date)}</span>
-                      <strong className="mp-h-type">{p.type}</strong>
-                      <strong className="mp-h-amount">{rupees(p.amount)}</strong>
-                      <span className="mp-h-ref">{p.ref}</span>
-                      <span className="mp-h-status">
-                        <Badge tone={STATUS_TONE[p.status] ?? "blue"}>{p.status}</Badge>
-                      </span>
-                      <button type="button" className="mp-link mp-h-action" onClick={() => viewReceipt(p)}>
-                        View <ArrowRight size={14} />
-                      </button>
+              <ul className="mp-debt-list">
+                {debts.map((d) => {
+                  const repaid =
+                    d.approvedAmount > 0
+                      ? Math.round(((d.approvedAmount - d.outstanding) / d.approvedAmount) * 100)
+                      : 0;
+                  const interestWaiting = pendingKinds.has("interest");
+                  const principalWaiting = pendingKinds.has("principal");
+
+                  return (
+                    <li key={d.id} className="mp-debt">
+                      <div className="mp-debt__top">
+                        <div>
+                          <strong>{rupees(d.outstanding)}</strong>
+                          <span>
+                            still to repay · {rupees(d.approvedAmount)} taken on {fmtDate(d.disbursedAt)}
+                          </span>
+                        </div>
+                        <Badge tone="blue">Request #{d.id}</Badge>
+                      </div>
+
+                      <div className="mp-bar" role="img" aria-label={`${repaid}% repaid`}>
+                        <span style={{ width: `${Math.min(Math.max(repaid, 0), 100)}%` }} />
+                      </div>
+                      <small className="mp-debt__repaid">{repaid}% of the principal repaid</small>
+
+                      <p className="mp-debt__interest">
+                        Interest this month: <b>{rupees(d.interest)}</b>
+                        <small>
+                          {rate}% of {rupees(d.outstanding)} = {rupees(d.monthlyInterest)} a month
+                        </small>
+                      </p>
+
+                      <div className="mp-btnrow">
+                        <button
+                          type="button"
+                          className="mp-btn mp-btn--primary"
+                          disabled={d.interest <= 0 || interestWaiting}
+                          onClick={() => setModal({ type: "interest", debt: d })}
+                        >
+                          {interestWaiting
+                            ? "Interest payment pending"
+                            : d.interest > 0
+                              ? `Pay Interest ${rupees(d.interest)}`
+                              : "Interest paid this month"}
+                        </button>
+                        <button
+                          type="button"
+                          className="mp-btn"
+                          disabled={principalWaiting}
+                          onClick={() => setModal({ type: "principal", debt: d })}
+                        >
+                          {principalWaiting ? "Principal payment pending" : "Pay Principal"}
+                        </button>
+                      </div>
                     </li>
-                  ))}
-                </ul>
-              </>
+                  );
+                })}
+              </ul>
             )}
           </Card>
+        </div>
 
-          {/* ---------- Loan / emergency fund repayment ---------- */}
-          <Card className="mp-o9" title="Loan / Emergency Fund Repayment" subtitle="Separate from your Sangha contribution">
-            <dl className="mp-kv mp-kv--3">
-              <KV label="Principal Outstanding" value={rupees(outstanding)} loading={loading} />
-              <KV label="Interest Outstanding" value={NA} />
-              <KV label="Total Payable" value={NA} />
-            </dl>
-            <div className="mp-btnrow">
-              <button type="button" className="mp-btn mp-btn--primary" disabled>
-                Pay Principal
-              </button>
-              <button type="button" className="mp-btn" disabled>
-                Pay Interest
-              </button>
-            </div>
-          </Card>
-
-          {/* ---------- Breakdown ---------- */}
-          <Card className="mp-o10" title="Payment Breakdown" subtitle={monthLabel}>
-            {loading ? (
-              <Skel h={130} />
-            ) : breakdownTotal === 0 ? (
-              <Empty text="No principal or interest payments this month." />
-            ) : (
-              <div className="mp-break">
-                <div
-                  className="mp-donut"
-                  role="img"
-                  aria-label={`Principal ${Math.round(principalShare)} percent, interest ${Math.round(100 - principalShare)} percent`}
-                  style={{
-                    background: `conic-gradient(var(--mp-royal) 0 ${principalShare}%, var(--mp-bright) ${principalShare}% 100%)`,
-                  }}
-                >
-                  <div className="mp-donut__hole">
-                    <small>Total Paid</small>
-                    <strong>{rupees(breakdownTotal)}</strong>
-                  </div>
+        <Card className="mp-payto-card" title="Where to Pay" subtitle="The Sangha Savings Account">
+          {loading ? (
+            <Skel h={170} />
+          ) : !account ? (
+            <Empty text="No active Sangha Savings Account." />
+          ) : (
+            <>
+              <div className="mp-acct__head">
+                <span className="mp-acct__icon">
+                  <Landmark size={18} />
+                </span>
+                <div>
+                  <strong>{sangha?.name}</strong>
+                  <small>Code: {sangha?.code}</small>
                 </div>
-                <ul className="mp-break__list">
-                  <li><i className="mp-dot mp-dot--royal" /> Principal <b>{rupees(principalPaid)}</b></li>
-                  <li><i className="mp-dot mp-dot--bright" /> Interest <b>{rupees(interestPaid)}</b></li>
-                  <li><i className="mp-dot mp-dot--navy" /> Contribution <b className="mp-na">{NA}</b></li>
-                </ul>
+                <Badge tone={account.status === "Active" ? "green" : "orange"}>{account.status}</Badge>
               </div>
-            )}
-          </Card>
-        </div>
 
-        <div className="mp-side">
-          {/* ---------- Status ---------- */}
-          <Card className="mp-o4" title="Payment Status">
-            <ul className="mp-status">
-              <li><span>Today&apos;s contribution</span><b className="mp-na">{NA}</b></li>
-              <li><span>Previous contribution</span><b className="mp-na">{NA}</b></li>
-              <li><span>Interest due</span><b className="mp-na">{NA}</b></li>
-              <li><span>Principal outstanding</span><b>{loading ? <Skel w={60} h={14} /> : rupees(outstanding)}</b></li>
-            </ul>
-          </Card>
+              <dl className="mp-kv">
+                <KV label="Account Holder" value={account.accountHolder} />
+                <KV label="Bank" value={account.bank} />
+                <KV label="Account No" value={account.accountNumberMasked} />
+                <KV label="IFSC" value={account.ifsc} />
+                <KV label="Branch" value={account.branch} />
+              </dl>
 
-          {/* ---------- Sangha savings account ---------- */}
-          <Card className="mp-o6" title="Sangha Savings Account" subtitle="The Sangha's account, not your personal balance">
-            {loading ? (
-              <Skel h={160} />
-            ) : !account ? (
-              <Empty text="No active Sangha Savings Account." />
-            ) : (
-              <>
-                <div className="mp-acct__head">
-                  <span className="mp-acct__icon"><Landmark size={18} /></span>
-                  <div>
-                    <strong>{sangha?.name}</strong>
-                    <small>Code: {sangha?.code}</small>
-                  </div>
-                  <Badge tone={account.status === "Active" ? "green" : "orange"}>{account.status}</Badge>
-                </div>
-                <dl className="mp-kv mp-kv--acct">
-                  <KV label="Bank Name" value={account.bank} />
-                  <KV label="Account Holder" value={account.accountHolder} />
-                  <KV label="Account No" value={account.accountNumberMasked} />
-                  <KV label="IFSC" value={account.ifsc} />
-                  <KV label="Branch" value={account.branch} />
-                  <KV label="Account Type" value={account.accountType} />
-                </dl>
-                <div className="mp-balance">
-                  <span>Available Balance</span>
-                  <strong>{rupees(ov?.fund?.balance)}</strong>
-                </div>
-              </>
-            )}
-          </Card>
-
-          {/* ---------- Upcoming ---------- */}
-          <Card className="mp-o7" title="Upcoming Payments">
-            <div className="mp-empty">
-              <Clock size={22} />
-              <p>{NA}</p>
-            </div>
-          </Card>
-
-          {/* ---------- Financial position ---------- */}
-          <Card className="mp-o11" title="Financial Position">
-            <dl className="mp-kv">
-              <KV label="Current Month" value={monthLabel} />
-              <KV label="Contribution" value={NA} />
-              <KV label="Money Received" value={rupees(member?.receivedThisMonth)} loading={loading} />
-              <KV label="Outstanding" value={rupees(member?.outstanding)} loading={loading} />
-              <KV label="Total Repaid" value={rupees(member?.totalRepaid)} loading={loading} />
-            </dl>
-          </Card>
-
-          {/* ---------- Receipt ---------- */}
-          <section id="mp-receipt" className="mp-card mp-o12 mp-receipt">
-            {!receipt ? (
-              <Empty text="Your latest receipt will appear here." />
-            ) : (
-              <>
-                <div className="mp-receipt__top">
-                  <CheckCircle2 size={22} />
-                  <strong>Payment {receipt.status === "Paid" ? "Successful" : receipt.status}</strong>
-                </div>
-                <dl className="mp-kv">
-                  <KV label={receipt.type} value={rupees(receipt.amount)} />
-                  <KV label="Date" value={fmtDate(receipt.date)} />
-                  <KV label="Transaction ID" value={receipt.ref} />
-                </dl>
-                <button type="button" className="mp-btn mp-btn--block" onClick={() => downloadReceipt(receipt)}>
-                  <Download size={16} /> Download Receipt
-                </button>
-              </>
-            )}
-          </section>
-        </div>
+              <ol className="mp-steps">
+                <li>Pay the amount to this account by UPI or bank transfer.</li>
+                <li>
+                  Tap <b>Pay</b> for your contribution, interest or principal and enter the transaction ID.
+                </li>
+                <li>Your admin confirms it. Your dues then update and you are notified.</li>
+              </ol>
+            </>
+          )}
+        </Card>
       </div>
+
+      {/* ---------- History ---------- */}
+      <Card className="mp-history" title="Payment History" subtitle="Everything you have paid or submitted">
+        <div className="mp-filters" role="group" aria-label="Filter payments">
+          {FILTERS.map((f) => (
+            <button
+              key={f}
+              type="button"
+              className={`mp-chip ${filter === f ? "mp-chip--active" : ""}`}
+              onClick={() => setFilter(f)}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+
+        <label className="mp-field mp-search-field">
+          <span>Search</span>
+          <div className="mp-search">
+            <Search size={16} />
+            <input
+              type="search"
+              placeholder="Search by type or reference"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+        </label>
+
+        {loading ? (
+          <Skel h={120} />
+        ) : histError ? (
+          <ErrorBox text={histError} onRetry={load} />
+        ) : filtered.length === 0 ? (
+          <Empty text={payments.length === 0 ? "No payments yet." : "No payments match your filters."} />
+        ) : (
+          <>
+            <div className="mp-hrow mp-hrow--head" aria-hidden="true">
+              <span>Date</span>
+              <span>Type</span>
+              <span>Amount</span>
+              <span>Reference ID</span>
+              <span>Status</span>
+              <span>Action</span>
+            </div>
+            <ul className="mp-hlist">
+              {filtered.map((p) => {
+                const retry = p.status === "Failed" ? retryTarget(p) : null;
+                return (
+                  <li key={p.id} className="mp-hrow">
+                    <span className="mp-h-date">{fmtDate(p.date)}</span>
+                    <strong className="mp-h-type">{p.type}</strong>
+                    <strong className="mp-h-amount">{rupees(p.amount)}</strong>
+                    <span className="mp-h-ref">{p.ref}</span>
+                    <span className="mp-h-status">
+                      <Badge tone={STATUS_TONE[p.status] ?? "blue"}>{p.status}</Badge>
+                      {p.status === "Failed" && p.reason && <small>{p.reason}</small>}
+                    </span>
+
+                    {p.status === "Paid" && (
+                      <button type="button" className="mp-link mp-h-action" onClick={() => downloadReceipt(p)}>
+                        <Download size={14} /> Receipt
+                      </button>
+                    )}
+                    {p.status === "Pending" && <span className="mp-h-action mp-h-wait">Awaiting admin</span>}
+                    {p.status === "Failed" && (
+                      <button
+                        type="button"
+                        className="mp-link mp-h-action"
+                        disabled={!retry}
+                        onClick={() => retry && setModal(retry)}
+                      >
+                        Retry <ArrowRight size={14} />
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
+      </Card>
+
+      {modalProps && (
+        <PayModal
+          key={modalProps.key}
+          title={modalProps.title}
+          subtitle={modalProps.subtitle}
+          amount={modalProps.amount}
+          max={modalProps.max}
+          editable={modalProps.editable}
+          account={account}
+          submit={modalProps.submit}
+          onClose={() => setModal(null)}
+          onDone={() => {
+            setSelected(new Set());
+            load();
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -130,12 +130,40 @@ function Field({ label, children, wide }) {
 ==================================================================== */
 
 function ApproveModal({ item, onClose, onConfirm }) {
+  const [d, setD] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [amount, setAmount] = useState(String(item.amount));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get(`/sangha-savings/requests/${item.id}`);
+        if (!cancelled) setD(res.data);
+      } catch (err) {
+        console.error("Error loading review details:", err);
+        if (!cancelled) setLoadError(errorText(err, "Unable to load the member's history."));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [item.id]);
+
+  const n = Number(amount);
+  const fund = d?.availableFund;
+  const verified = d?.verification === "Verified";
+  const fundShort = fund != null && n > fund;
+  const hasDebt = (d?.currentOutstanding ?? 0) > 0;
+  const canConfirm =
+    !busy && !loading && !loadError && verified && n > 0 && n <= item.amount && !fundShort;
+
   const confirm = async () => {
-    const n = Number(amount);
     if (!(n > 0)) {
       setError("Enter an approved amount greater than ₹0.");
       return;
@@ -158,47 +186,122 @@ function ApproveModal({ item, onClose, onConfirm }) {
   };
 
   return (
-    <Modal title="Approve Fund Request" subtitle={`${item.memberName} · ${item.sanghaName}`} onClose={onClose}>
-      <dl className="fr-grid fr-grid--tight">
-        <Field label="Requested Amount">{rupees(item.amount)}</Field>
-        <Field label="Monthly Salary">{rupees(item.monthlySalary)}</Field>
-      </dl>
+    <Modal
+      title="Review & Approve"
+      subtitle={`${item.memberName} · ${item.sanghaName}`}
+      onClose={onClose}
+    >
+      {loading ? (
+        <span className="fr-skel" style={{ height: 220 }} />
+      ) : loadError ? (
+        <div className="fr-alert">{loadError}</div>
+      ) : (
+        <>
+          <h4 className="fr-section-title">Request</h4>
+          <dl className="fr-grid">
+            <Field label="Member">{d.memberName}</Field>
+            <Field label="Sangha">{d.sangha.name} ({d.sangha.code})</Field>
+            <Field label="Requested Amount">{rupees(d.amount)}</Field>
+            <Field label="Monthly Salary">{rupees(d.monthlySalary)}</Field>
+            <Field label="Sangha Fund Available">{rupees(d.availableFund)}</Field>
+            <Field label="Verification">{d.verification}</Field>
+            <Field label="Reason" wide>{d.reason}</Field>
+          </dl>
 
-      <label className="fr-input">
-        Approved Amount (₹)
-        <input
-          type="number"
-          min="1"
-          max={item.amount}
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-          disabled={busy}
-        />
-      </label>
+          <h4 className="fr-section-title">Existing debt</h4>
+          <div className={`fr-debt ${hasDebt ? "fr-debt--warn" : ""}`}>
+            <strong>{rupees(d.currentOutstanding)}</strong>
+            <span>
+              {hasDebt
+                ? "This member already owes the Sangha"
+                : "No outstanding debt"}
+            </span>
+          </div>
+          {d.activeDebts.length > 0 && (
+            <ul className="fr-mini">
+              {d.activeDebts.map((a) => (
+                <li key={a.id}>
+                  <span>Request #{a.id} · {fmtDate(a.disbursedAt)}</span>
+                  <b>
+                    {rupees(a.outstanding)} of {rupees(a.approvedAmount)} left
+                  </b>
+                </li>
+              ))}
+            </ul>
+          )}
 
-      <p className="fr-note">
-        Approving does not move any money. Disbursement is a separate step.
-      </p>
+          <h4 className="fr-section-title">Interest & repayment history</h4>
+          <dl className="fr-grid">
+            <Field label="Previous Requests">{d.previousRequests}</Field>
+            <Field label="Completed Requests">{d.completedRequests}</Field>
+            <Field label="Total Interest Paid">{rupees(d.totalInterestPaid)}</Field>
+            <Field label="Paid On Time" wide>
+              {d.totalRepayments > 0
+                ? `${d.onTimeRepayments} of ${d.totalRepayments} repayments (${d.repaymentConsistency}%)`
+                : "No repayments yet"}
+            </Field>
+          </dl>
 
-      {!item.memberVerified && (
-        <div className="fr-alert fr-alert--warn">
-          <AlertTriangle size={16} /> This member&apos;s account must be verified before approval.
-        </div>
+          {d.repayments.length > 0 && (
+            <ul className="fr-mini">
+              {d.repayments.map((p, i) => (
+                <li key={`${p.paidAt}-${i}`}>
+                  <span>{fmtDate(p.paidAt)}</span>
+                  <span>
+                    {rupees(p.principal)} principal + {rupees(p.interest)} interest
+                  </span>
+                  <span className={`fr-badge fr-badge--${p.isOnTime ? "green" : "amber"}`}>
+                    {p.isOnTime ? "On time" : "Late"}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <label className="fr-input fr-input--spaced">
+            Approved Amount (₹)
+            <input
+              type="number"
+              min="1"
+              max={item.amount}
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              disabled={busy}
+            />
+          </label>
+
+          <p className="fr-note">
+            Approving credits this amount to the member immediately and deducts it from the
+            Sangha Savings balance. The member is notified.
+          </p>
+
+          {!verified && (
+            <div className="fr-alert fr-alert--warn">
+              <AlertTriangle size={16} /> The member&apos;s account must be verified before approval.
+            </div>
+          )}
+          {fundShort && (
+            <div className="fr-alert fr-alert--warn">
+              <AlertTriangle size={16} /> Only {rupees(fund)} is available in Sangha Savings.
+            </div>
+          )}
+          {hasDebt && (
+            <div className="fr-alert fr-alert--warn">
+              <AlertTriangle size={16} /> This member already has an outstanding debt. Review it before approving.
+            </div>
+          )}
+        </>
       )}
+
       {error && <div className="fr-alert">{error}</div>}
 
       <div className="fr-actions">
         <button type="button" className="fr-btn" onClick={onClose} disabled={busy}>
           Cancel
         </button>
-        <button
-          type="button"
-          className="fr-btn fr-btn--approve"
-          onClick={confirm}
-          disabled={busy || !item.memberVerified}
-        >
+        <button type="button" className="fr-btn fr-btn--approve" onClick={confirm} disabled={!canConfirm}>
           {busy ? <Loader2 size={16} className="fr-spin" /> : <CheckCircle2 size={16} />}
-          Confirm Approval
+          Approve &amp; Credit {n > 0 ? rupees(n) : ""}
         </button>
       </div>
     </Modal>
@@ -361,6 +464,189 @@ function DetailsModal({ item, onClose, onApprove, onReject, onStartReview, onDis
   );
 }
 
+function PaymentsToConfirm({ onChanged }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [busyKey, setBusyKey] = useState(null);
+  const [late, setLate] = useState({});
+  const [rejectKey, setRejectKey] = useState(null);
+  const [reason, setReason] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      setError("");
+      const [p, c] = await Promise.all([
+        api.get("/sangha-savings/payments/pending"),
+        api.get("/sangha-savings/contributions/pending"),
+      ]);
+
+      const payments = (p.data.items ?? []).map((x) => ({
+        key: `p${x.id}`,
+        type: "payment",
+        id: x.id,
+        memberName: x.memberName,
+        sanghaName: x.sanghaName,
+        label: x.kind === "interest" ? "Interest" : "Principal",
+        amount: x.amount,
+        reference: x.reference,
+        createdAt: x.createdAt,
+      }));
+
+      const contributions = (c.data.items ?? []).map((x) => ({
+        key: `c${x.batchId}`,
+        type: "contribution",
+        id: x.batchId,
+        memberName: x.memberName,
+        sanghaName: x.sanghaName,
+        label: `Contribution · ${x.days.length} day${x.days.length === 1 ? "" : "s"}`,
+        days: x.days,
+        amount: x.amount,
+        reference: x.reference,
+        createdAt: x.createdAt,
+      }));
+
+      setItems(
+        [...payments, ...contributions].sort(
+          (a, b) => new Date(a.createdAt) - new Date(b.createdAt),
+        ),
+      );
+    } catch (err) {
+      console.error("Error loading payments:", err);
+      setError(errorText(err, "Unable to load payments to confirm."));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const act = async (key, fn) => {
+    setBusyKey(key);
+    setError("");
+    try {
+      await fn();
+      setRejectKey(null);
+      setReason("");
+      await load();
+      await onChanged?.();
+    } catch (err) {
+      console.error("Payment action failed:", err);
+      setError(errorText(err, "Unable to complete this action."));
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const confirm = (p) =>
+    act(p.key, () =>
+      p.type === "payment"
+        ? api.post(`/sangha-savings/payments/${p.id}/confirm`, { is_on_time: !late[p.key] })
+        : api.post(`/sangha-savings/contributions/${p.id}/confirm`, {}),
+    );
+
+  const reject = (p) =>
+    act(p.key, () =>
+      api.post(
+        `/sangha-savings/${p.type === "payment" ? "payments" : "contributions"}/${p.id}/reject`,
+        { reason: reason.trim() },
+      ),
+    );
+
+  if (loading || (!error && items.length === 0)) return null;
+
+  return (
+    <section className="fr-pay">
+      <h2>Payments to confirm</h2>
+      <p>
+        Members say they paid these. Confirm only after the money has reached the Sangha account.
+      </p>
+
+      {error && <div className="fr-alert">{error}</div>}
+
+      <ul className="fr-pay__list">
+        {items.map((p) => (
+          <li key={p.key} className="fr-pay__item">
+            <div className="fr-pay__top">
+              <div>
+                <strong>{p.memberName}</strong>
+                <span>
+                  {p.sanghaName} · {fmtDate(p.createdAt)}
+                </span>
+              </div>
+              <div className="fr-pay__amount">
+                {rupees(p.amount)}
+                <small>{p.label}</small>
+              </div>
+            </div>
+
+            {p.days && (
+              <div className="fr-pay__ref">
+                Days: <b>{p.days.map((d) => fmtDate(d)).join(", ")}</b>
+              </div>
+            )}
+
+            <div className="fr-pay__ref">
+              Reference: <b>{p.reference}</b>
+            </div>
+
+            {rejectKey === p.key ? (
+              <div className="fr-pay__reject">
+                <input
+                  type="text"
+                  placeholder="Why was it not received?"
+                  maxLength={255}
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  disabled={busyKey === p.key}
+                />
+                <div className="fr-actions">
+                  <button type="button" className="fr-btn" onClick={() => setRejectKey(null)} disabled={busyKey === p.key}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="fr-btn fr-btn--reject-solid"
+                    onClick={() => reject(p)}
+                    disabled={busyKey === p.key || reason.trim().length < 3}
+                  >
+                    {busyKey === p.key ? <Loader2 size={16} className="fr-spin" /> : <XCircle size={16} />}
+                    Reject Payment
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                {p.type === "payment" && (
+                  <label className="fr-pay__check">
+                    <input
+                      type="checkbox"
+                      checked={!late[p.key]}
+                      onChange={(e) => setLate((prev) => ({ ...prev, [p.key]: !e.target.checked }))}
+                    />
+                    Paid on time
+                  </label>
+                )}
+                <div className="fr-actions">
+                  <button type="button" className="fr-btn fr-btn--reject" onClick={() => setRejectKey(p.key)} disabled={busyKey === p.key}>
+                    Not received
+                  </button>
+                  <button type="button" className="fr-btn fr-btn--approve" onClick={() => confirm(p)} disabled={busyKey === p.key}>
+                    {busyKey === p.key ? <Loader2 size={16} className="fr-spin" /> : <CheckCircle2 size={16} />}
+                    Confirm Received
+                  </button>
+                </div>
+              </>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 /* ====================================================================
    PAGE
 ==================================================================== */
@@ -415,7 +701,7 @@ export default function FundRequests({ onChanged }) {
   const approve = async (item, approvedAmount) => {
     await review(item.id, { action: "approve", approved_amount: approvedAmount });
     await afterChange();
-    setNotice(`Approved ${rupees(approvedAmount)} for ${item.memberName}. The member has been notified.`);
+    setNotice(`${rupees(approvedAmount)} credited to ${item.memberName}. The member has been notified.`);
   };
 
   const reject = async (item, reason) => {
@@ -450,6 +736,7 @@ export default function FundRequests({ onChanged }) {
           <RefreshCw size={16} /> <span>Refresh</span>
         </button>
       </header>
+      <PaymentsToConfirm onChanged={afterChange} />
 
       <div className="fr-tabs" role="tablist">
         {TABS.map((t) => (

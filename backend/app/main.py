@@ -2776,6 +2776,83 @@ def create_fund_request(
 # ---------------------------------------------------------------------
 # GET /sangha-savings/requests/{id}   (admin / superadmin review detail)
 # ---------------------------------------------------------------------
+
+def _month_shift(first_of_month: date, k: int) -> date:
+    total = first_of_month.year * 12 + (first_of_month.month - 1) + k
+    return date(total // 12, total % 12 + 1, 1)
+
+
+def _member_contribution_summary(db: Session, member_id: int) -> dict:
+    """What this member has contributed to the Sangha: all-time totals plus the last 6 months."""
+    today = _today_ist()
+    cur = today.replace(day=1)
+
+    first_date = (
+        db.query(func.min(Contribution.for_date))
+        .filter(Contribution.member_id == member_id, Contribution.status == "Confirmed")
+        .scalar()
+    )
+    # Months before the first contribution are not counted as missed
+    start = cur if not first_date else max(_month_shift(cur, -5), first_date.replace(day=1))
+
+    totals = (
+        db.query(func.coalesce(func.sum(Contribution.amount), 0), func.count(Contribution.id))
+        .filter(Contribution.member_id == member_id, Contribution.status == "Confirmed")
+        .one()
+    )
+    waiting_amount = (
+        db.query(func.coalesce(func.sum(Contribution.amount), 0))
+        .filter(Contribution.member_id == member_id, Contribution.status == "Pending")
+        .scalar()
+    )
+
+    rows = (
+        db.query(Contribution)
+        .filter(
+            Contribution.member_id == member_id,
+            Contribution.status.in_(("Pending", "Confirmed")),
+            Contribution.for_date >= start,
+        )
+        .all()
+    )
+    paid, waiting, amount = {}, {}, {}
+    for r in rows:
+        key = (r.for_date.year, r.for_date.month)
+        if r.status == "Confirmed":
+            paid[key] = paid.get(key, 0) + 1
+            amount[key] = amount.get(key, ZERO) + _d(r.amount)
+        else:
+            waiting[key] = waiting.get(key, 0) + 1
+
+    months = []
+    m = start
+    while m <= cur:
+        key = (m.year, m.month)
+        last = date(m.year, m.month, calendar.monthrange(m.year, m.month)[1])
+        lo = max(m, first_date) if first_date else m
+        hi = min(last, today)
+        expected = max((hi - lo).days + 1, 0)
+        paid_days, waiting_days = paid.get(key, 0), waiting.get(key, 0)
+        months.append({
+            "month": m.strftime("%B %Y"),
+            "expectedDays": expected,
+            "paidDays": paid_days,
+            "waitingDays": waiting_days,
+            "missedDays": max(expected - paid_days - waiting_days, 0),
+            "paidAmount": float(amount.get(key, ZERO)),
+        })
+        m = _month_shift(m, 1)
+    months.reverse()   # newest first
+
+    return {
+        "dailyAmount": float(CONTRIBUTION_PER_DAY),
+        "totalPaid": float(_d(totals[0])),
+        "daysPaid": int(totals[1]),
+        "since": first_date.isoformat() if first_date else None,
+        "waitingAmount": float(_d(waiting_amount)),
+        "months": months,
+    }
+
 @app.get("/sangha-savings/requests/{request_id}")
 def get_fund_request_detail(
     request_id: int,
@@ -2793,15 +2870,17 @@ def get_fund_request_detail(
         .order_by(FundRepayment.paid_at.desc())
         .all()
     )
-
-    active = (
-        db.query(FundRequest)
-        .filter(FundRequest.member_id == req.member_id, FundRequest.status.in_(ACTIVE_STATUSES))
-        .order_by(FundRequest.disbursed_at.desc())
-        .all()
-    )
-    active_map = _repaid_map(db, [a.id for a in active])
+    debts = _member_debts(db, req.member_id)
     rm = _repaid_map(db, [req.id])
+
+    borrowed = (
+        db.query(func.coalesce(func.sum(FundRequest.amount_approved), 0))
+        .filter(
+            FundRequest.member_id == req.member_id,
+            FundRequest.status.in_(ACTIVE_STATUSES + (FundRequestStatus.completed,)),
+        )
+        .scalar()
+    )
 
     return {
         "id": req.id,
@@ -2822,7 +2901,22 @@ def get_fund_request_detail(
         "currentOutstanding": trust["currentOutstanding"],
         "repaymentConsistency": trust["repaymentConsistency"],
         "requestOutstanding": float(_outstanding_of(req, rm)),
-        # Interest / repayment history
+        # ---- debt ----
+        "totalBorrowed": float(_d(borrowed)),
+        "totalRepaidPrincipal": float(sum((_d(p.principal) for p in all_reps), ZERO)),
+        "interestDueNow": float(sum((x["interest"] for x in debts), ZERO)),
+        "interestRate": float(INTEREST_RATE_PERCENT),
+        "activeDebts": [
+            {
+                "id": x["req"].id,
+                "approvedAmount": float(x["req"].amount_approved or 0),
+                "outstanding": float(x["outstanding"]),
+                "interest": float(x["interest"]),
+                "disbursedAt": x["req"].disbursed_at.isoformat() if x["req"].disbursed_at else None,
+            }
+            for x in debts
+        ],
+        # ---- interest / repayment history ----
         "totalInterestPaid": float(sum((_d(p.interest) for p in all_reps), ZERO)),
         "totalRepayments": len(all_reps),
         "onTimeRepayments": sum(1 for p in all_reps if p.is_on_time),
@@ -2831,16 +2925,8 @@ def get_fund_request_detail(
              "interest": float(p.interest), "isOnTime": p.is_on_time}
             for p in all_reps[:10]
         ],
-        # Debt the member already has
-        "activeDebts": [
-            {
-                "id": a.id,
-                "approvedAmount": float(a.amount_approved or 0),
-                "outstanding": float(_outstanding_of(a, active_map)),
-                "disbursedAt": a.disbursed_at.isoformat() if a.disbursed_at else None,
-            }
-            for a in active
-        ],
+        # ---- Sangha contributions ----
+        "contributions": _member_contribution_summary(db, req.member_id),
     }
 
 # ---------------------------------------------------------------------

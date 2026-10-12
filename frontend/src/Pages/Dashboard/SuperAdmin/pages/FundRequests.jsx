@@ -126,26 +126,23 @@ function Field({ label, children, wide }) {
 }
 
 /* ====================================================================
-   APPROVE MODAL
+   REVIEW DATA (used by both the Details and the Approve screens)
 ==================================================================== */
 
-function ApproveModal({ item, onClose, onConfirm }) {
+function useRequestDetail(id) {
   const [d, setD] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
-  const [amount, setAmount] = useState(String(item.amount));
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const res = await api.get(`/sangha-savings/requests/${item.id}`);
+        const res = await api.get(`/sangha-savings/requests/${id}`);
         if (!cancelled) setD(res.data);
       } catch (err) {
         console.error("Error loading review details:", err);
-        if (!cancelled) setLoadError(errorText(err, "Unable to load the member's history."));
+        if (!cancelled) setError(errorText(err, "Unable to load the member's history."));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -153,13 +150,115 @@ function ApproveModal({ item, onClose, onConfirm }) {
     return () => {
       cancelled = true;
     };
-  }, [item.id]);
+  }, [id]);
+
+  return { d, loading, error };
+}
+
+function ReviewInfo({ d }) {
+  const hasDebt = d.currentOutstanding > 0;
+  const c = d.contributions;
+
+  return (
+    <>
+      <h4 className="fr-section-title">Debt</h4>
+      <div className={`fr-debt ${hasDebt ? "fr-debt--warn" : ""}`}>
+        <strong>{rupees(d.currentOutstanding)}</strong>
+        <span>{hasDebt ? "remaining debt this member still owes" : "No outstanding debt"}</span>
+      </div>
+
+      <dl className="fr-grid fr-grid--tight">
+        <Field label="Total Borrowed">{rupees(d.totalBorrowed)}</Field>
+        <Field label="Principal Repaid">{rupees(d.totalRepaidPrincipal)}</Field>
+        <Field label={`Interest Due Now (${d.interestRate}%)`}>{rupees(d.interestDueNow)}</Field>
+      </dl>
+
+      {d.activeDebts.length > 0 && (
+        <ul className="fr-mini">
+          {d.activeDebts.map((a) => (
+            <li key={a.id}>
+              <span>
+                Request #{a.id} · {fmtDate(a.disbursedAt)}
+              </span>
+              <b>
+                {rupees(a.outstanding)} of {rupees(a.approvedAmount)} left
+              </b>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <h4 className="fr-section-title">Contributions to the Sangha</h4>
+      <dl className="fr-grid fr-grid--tight">
+        <Field label="Total Contributed">{rupees(c.totalPaid)}</Field>
+        <Field label="Days Paid">{c.daysPaid}</Field>
+        <Field label="Contributing Since">{c.since ? fmtDate(c.since) : "No contributions yet"}</Field>
+        {c.waitingAmount > 0 && (
+          <Field label="Waiting for Confirmation">{rupees(c.waitingAmount)}</Field>
+        )}
+      </dl>
+
+      <ul className="fr-mini">
+        {c.months.map((m) => (
+          <li key={m.month}>
+            <span>{m.month}</span>
+            <span>
+              {m.paidDays} of {m.expectedDays} days · {rupees(m.paidAmount)}
+            </span>
+            <span className={`fr-badge fr-badge--${m.missedDays === 0 ? "green" : "red"}`}>
+              {m.missedDays === 0 ? "On track" : `${m.missedDays} missed`}
+            </span>
+          </li>
+        ))}
+      </ul>
+
+      <h4 className="fr-section-title">Interest & repayment history</h4>
+      <dl className="fr-grid fr-grid--tight">
+        <Field label="Previous Requests">{d.previousRequests}</Field>
+        <Field label="Completed Requests">{d.completedRequests}</Field>
+        <Field label="Total Interest Paid">{rupees(d.totalInterestPaid)}</Field>
+        <Field label="Paid On Time" wide>
+          {d.totalRepayments > 0
+            ? `${d.onTimeRepayments} of ${d.totalRepayments} repayments (${d.repaymentConsistency}%)`
+            : "No repayments yet"}
+        </Field>
+      </dl>
+
+      {d.repayments.length > 0 && (
+        <ul className="fr-mini">
+          {d.repayments.map((p, i) => (
+            <li key={`${p.paidAt}-${i}`}>
+              <span>{fmtDate(p.paidAt)}</span>
+              <span>
+                {rupees(p.principal)} principal + {rupees(p.interest)} interest
+              </span>
+              <span className={`fr-badge fr-badge--${p.isOnTime ? "green" : "amber"}`}>
+                {p.isOnTime ? "On time" : "Late"}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+/* ====================================================================
+   APPROVE MODAL
+==================================================================== */
+
+function ApproveModal({ item, onClose, onConfirm }) {
+  const { d, loading, error: loadError } = useRequestDetail(item.id);
+  const [amount, setAmount] = useState(String(item.amount));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
   const n = Number(amount);
   const fund = d?.availableFund;
   const verified = d?.verification === "Verified";
   const fundShort = fund != null && n > fund;
   const hasDebt = (d?.currentOutstanding ?? 0) > 0;
+  const missedThisMonth = d?.contributions?.months?.[0]?.missedDays ?? 0;
   const canConfirm =
     !busy && !loading && !loadError && verified && n > 0 && n <= item.amount && !fundShort;
 
@@ -192,7 +291,7 @@ function ApproveModal({ item, onClose, onConfirm }) {
       onClose={onClose}
     >
       {loading ? (
-        <span className="fr-skel" style={{ height: 220 }} />
+        <span className="fr-skel" style={{ height: 260 }} />
       ) : loadError ? (
         <div className="fr-alert">{loadError}</div>
       ) : (
@@ -208,55 +307,7 @@ function ApproveModal({ item, onClose, onConfirm }) {
             <Field label="Reason" wide>{d.reason}</Field>
           </dl>
 
-          <h4 className="fr-section-title">Existing debt</h4>
-          <div className={`fr-debt ${hasDebt ? "fr-debt--warn" : ""}`}>
-            <strong>{rupees(d.currentOutstanding)}</strong>
-            <span>
-              {hasDebt
-                ? "This member already owes the Sangha"
-                : "No outstanding debt"}
-            </span>
-          </div>
-          {d.activeDebts.length > 0 && (
-            <ul className="fr-mini">
-              {d.activeDebts.map((a) => (
-                <li key={a.id}>
-                  <span>Request #{a.id} · {fmtDate(a.disbursedAt)}</span>
-                  <b>
-                    {rupees(a.outstanding)} of {rupees(a.approvedAmount)} left
-                  </b>
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <h4 className="fr-section-title">Interest & repayment history</h4>
-          <dl className="fr-grid">
-            <Field label="Previous Requests">{d.previousRequests}</Field>
-            <Field label="Completed Requests">{d.completedRequests}</Field>
-            <Field label="Total Interest Paid">{rupees(d.totalInterestPaid)}</Field>
-            <Field label="Paid On Time" wide>
-              {d.totalRepayments > 0
-                ? `${d.onTimeRepayments} of ${d.totalRepayments} repayments (${d.repaymentConsistency}%)`
-                : "No repayments yet"}
-            </Field>
-          </dl>
-
-          {d.repayments.length > 0 && (
-            <ul className="fr-mini">
-              {d.repayments.map((p, i) => (
-                <li key={`${p.paidAt}-${i}`}>
-                  <span>{fmtDate(p.paidAt)}</span>
-                  <span>
-                    {rupees(p.principal)} principal + {rupees(p.interest)} interest
-                  </span>
-                  <span className={`fr-badge fr-badge--${p.isOnTime ? "green" : "amber"}`}>
-                    {p.isOnTime ? "On time" : "Late"}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
+          <ReviewInfo d={d} />
 
           <label className="fr-input fr-input--spaced">
             Approved Amount (₹)
@@ -287,7 +338,13 @@ function ApproveModal({ item, onClose, onConfirm }) {
           )}
           {hasDebt && (
             <div className="fr-alert fr-alert--warn">
-              <AlertTriangle size={16} /> This member already has an outstanding debt. Review it before approving.
+              <AlertTriangle size={16} /> This member still owes {rupees(d.currentOutstanding)}. Review it before approving.
+            </div>
+          )}
+          {missedThisMonth > 0 && (
+            <div className="fr-alert fr-alert--warn">
+              <AlertTriangle size={16} /> This member has missed {missedThisMonth} contribution day
+              {missedThisMonth === 1 ? "" : "s"} this month.
             </div>
           )}
         </>
@@ -307,7 +364,6 @@ function ApproveModal({ item, onClose, onConfirm }) {
     </Modal>
   );
 }
-
 /* ====================================================================
    REJECT MODAL
 ==================================================================== */
@@ -370,6 +426,7 @@ function RejectModal({ item, onClose, onConfirm }) {
 ==================================================================== */
 
 function DetailsModal({ item, onClose, onApprove, onReject, onStartReview, onDisburse }) {
+  const detail = useRequestDetail(item.id);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [confirmDisburse, setConfirmDisburse] = useState(false);
@@ -394,6 +451,7 @@ function DetailsModal({ item, onClose, onApprove, onReject, onStartReview, onDis
         <Badge status={item.status} />
       </div>
 
+      <h4 className="fr-section-title">Request</h4>
       <dl className="fr-grid">
         <Field label="Request ID">#{item.id}</Field>
         <Field label="Status">{item.status}</Field>
@@ -412,6 +470,14 @@ function DetailsModal({ item, onClose, onApprove, onReject, onStartReview, onDis
         <Field label="Reason" wide>{item.reason}</Field>
         {item.rejectionReason && <Field label="Rejection Reason" wide>{item.rejectionReason}</Field>}
       </dl>
+
+      {detail.loading ? (
+        <span className="fr-skel" style={{ height: 200, marginTop: 16 }} />
+      ) : detail.error ? (
+        <div className="fr-alert">{detail.error}</div>
+      ) : (
+        <ReviewInfo d={detail.d} />
+      )}
 
       {error && <div className="fr-alert">{error}</div>}
 
@@ -463,7 +529,6 @@ function DetailsModal({ item, onClose, onApprove, onReject, onStartReview, onDis
     </Modal>
   );
 }
-
 function PaymentsToConfirm({ onChanged }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
